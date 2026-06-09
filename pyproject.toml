@@ -1,0 +1,35 @@
+[project]
+name = "agentcode"
+version = "0.1.0"
+description = "AgentCode terminal AI client"
+readme = "README.md"
+authors = [
+    { name = "1Chen1y1111", email = "fun20001016@163.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.105.2",
+    "openai>=2.41.0",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "textual>=8.2.7",
+]
+
+[project.scripts]
+agentcode = "agentcode.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8",
+    "ruff>=0.6",
+    "types-PyYAML>=6",
+]
+
+[tool.uv.build-backend]
+module-name = "agentcode"
+module-root = "src"
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.12.0"]
+build-backend = "uv_build"
