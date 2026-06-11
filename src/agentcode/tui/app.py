@@ -10,27 +10,36 @@ import time
 from enum import Enum
 from pathlib import Path
 
-from rich.text import Text
+from rich.console import RenderableType
+from textual.containers import VerticalScroll
 from textual.app import App, ComposeResult
 from textual.color import Color
 from textual.timer import Timer
-from textual.widgets import OptionList, RichLog, Static
+from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from agentcode import __version__
+from agentcode.agent import Agent, Phase
 from agentcode.config import ProviderConfig
 from agentcode.conversation import Conversation
 from agentcode.llm import Provider, new_provider
 from agentcode.prompt import render_banner
+from agentcode.tool import Registry, new_default_registry
 from agentcode.tui.input import ChatInput
 from agentcode.tui.scrollbar import install_scrollbar_renderer
 from agentcode.tui.view import (
-    assistant_markdown,
+    assistant_live,
     elapsed_block,
     error_block,
     status_text,
+    tool_done,
+    tool_pending,
     user_block,
+    working_text,
 )
+
+
+WORKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 class SessionState(Enum):
@@ -38,6 +47,18 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+
+
+class MessageWidget(Static):
+    """聊天消息组件，保留原始 Rich renderable 以便原地更新和测试观察。"""
+
+    def __init__(self, renderable: RenderableType, classes: str) -> None:
+        super().__init__(renderable, classes=classes)
+        self.renderable = renderable
+
+    def update_renderable(self, renderable: RenderableType) -> None:
+        self.renderable = renderable
+        self.update(renderable)
 
 
 class AgentCodeApp(App[None]):
@@ -94,7 +115,7 @@ class AgentCodeApp(App[None]):
         scrollbar-corner-color: transparent !important;
     }
 
-    App:ansi #log,
+    App:ansi #chat,
     App:ansi #selector {
         overflow-x: hidden !important;
     }
@@ -105,7 +126,7 @@ class AgentCodeApp(App[None]):
         padding: 1 2;
     }
 
-    #log {
+    #chat {
         height: 1fr;
         min-height: 6;
         overflow-x: hidden;
@@ -113,8 +134,9 @@ class AgentCodeApp(App[None]):
         padding: 1 0 1 2;
     }
 
-    #streaming {
-        padding: 1 0 1 2;
+    .message {
+        width: 100%;
+        height: auto;
     }
 
     #input {
@@ -129,20 +151,35 @@ class AgentCodeApp(App[None]):
         color: $text-muted;
         padding: 0 1;
     }
+
     """
 
-    BINDINGS = [("ctrl+c", "quit", "Quit")]
+    BINDINGS = [
+        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+t", "toggle_thinking", "Toggle thinking"),
+    ]
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(
+        self, providers: list[ProviderConfig], registry: Registry | None = None
+    ) -> None:
         super().__init__()
         install_scrollbar_renderer()
         self.providers = providers
+        self._tool_registry = registry or new_default_registry()
         self.provider: Provider | None = None
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.conv = Conversation()
+        self.cur_thinking = ""
         self.cur_reply = ""
+        self.hide_thinking = False
+        self._active_assistant: MessageWidget | None = None
+        self._active_tool: MessageWidget | None = None
+        self._working_widget: MessageWidget | None = None
+        self._active_tool_name = ""
+        self._active_tool_args = ""
         self.turn_start = 0.0
         self.turn_elapsed = 0
+        self._working_frame_index = 0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
 
@@ -154,8 +191,7 @@ class AgentCodeApp(App[None]):
             ],
             id="selector",
         )
-        yield RichLog(id="log", wrap=True, markup=False, highlight=False)
-        yield Static("", id="streaming")
+        yield VerticalScroll(id="chat")
         yield ChatInput(
             "",
             id="input",
@@ -163,10 +199,11 @@ class AgentCodeApp(App[None]):
         )
         yield Static("", id="statusbar")
 
-    def on_mount(self) -> None:
-        # banner 写入 RichLog 一次即可，后续 View 刷新不重复渲染。
-        self.query_one("#log", RichLog).write(
-            render_banner(__version__, str(Path.cwd()))
+    async def on_mount(self) -> None:
+        # banner 作为第一条消息挂入聊天容器；后续 View 刷新不会重复渲染。
+        await self._append_chat(
+            render_banner(__version__, str(Path.cwd())),
+            classes="message banner-message",
         )
         if len(self.providers) == 1:
             self.provider = new_provider(self.providers[0])
@@ -175,7 +212,7 @@ class AgentCodeApp(App[None]):
         self._apply_scrollbar_theme()
         self._update_statusbar()
         if self.state is SessionState.IDLE:
-            self.query_one("#input", ChatInput).focus()
+            self._focus_input()
         else:
             self.query_one("#selector", OptionList).focus()
 
@@ -187,7 +224,8 @@ class AgentCodeApp(App[None]):
         self._sync_visibility()
         self._apply_scrollbar_theme()
         self._update_statusbar()
-        self.query_one("#input", ChatInput).focus()
+        self._focus_input()
+        self.call_after_refresh(self._focus_input)
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         await self.submit(event.text)
@@ -203,95 +241,229 @@ class AgentCodeApp(App[None]):
             return
 
         input_box = self.query_one("#input", ChatInput)
-        log = self.query_one("#log", RichLog)
         self.conv.add_user(message)
-        log.write(user_block(message))
+        await self._append_chat(user_block(message), classes="message user-message")
+        input_box.add_history(message)
         input_box.load_text("")
         # 流式期间不接受新提交，但 Textual 事件循环仍继续运行。
         input_box.disabled = True
 
+        self.cur_thinking = ""
         self.cur_reply = ""
+        self._active_assistant = None
+        self._active_tool = None
+        self._active_tool_name = ""
+        self._active_tool_args = ""
         self.turn_elapsed = 0
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
-        self._refresh_streaming_view()
+        self._working_frame_index = 0
+        await self._show_working()
         # 计时器从请求发出前启动，覆盖“等待首 token”的时间。
-        self._timer = self.set_interval(0.2, self._tick)
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._timer = self.set_interval(0.1, self._tick)
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
 
-    async def _consume_stream(self) -> None:
+    async def _consume_agent_events(self) -> None:
         if self.provider is None:
             return
         try:
-            async for event in self.provider.stream(self.conv.messages()):
+            agent = Agent(self.provider, self._tool_registry)
+            async for event in agent.run(self.conv):
                 if event.err is not None:
-                    self._finish_with_error(event.err)
+                    await self._finish_with_error(event.err)
                     return
+                if event.thinking:
+                    self.cur_thinking += event.thinking
+                    await self._update_assistant_live()
                 if event.text:
-                    # 流式期间直接显示纯文本，结束后再写入 Markdown 定型块。
                     self.cur_reply += event.text
-                    self._refresh_streaming_view()
+                    await self._update_assistant_live()
+                if event.tool is not None:
+                    if event.tool.phase is Phase.START:
+                        # 工具调用会切开 assistant 回合：前言留在消息流里，
+                        # 后续最终答复会创建新的 assistant live widget。
+                        self.cur_thinking = ""
+                        self.cur_reply = ""
+                        self._active_assistant = None
+                        self._active_tool_name = event.tool.name
+                        self._active_tool_args = event.tool.args
+                        self._active_tool = await self._append_chat(
+                            tool_pending(
+                                event.tool.name,
+                                event.tool.args,
+                                self._elapsed_seconds(),
+                            ),
+                            classes="message tool-message",
+                        )
+                    elif event.tool.phase is Phase.END:
+                        tool_widget = self._active_tool
+                        if tool_widget is None:
+                            tool_widget = await self._append_chat(
+                                "",
+                                classes="message tool-message",
+                            )
+                        tool_widget.update_renderable(
+                            tool_done(
+                                event.tool.name,
+                                event.tool.args,
+                                event.tool.result,
+                                event.tool.is_error,
+                            )
+                        )
+                        self._active_tool = None
+                        self._active_tool_name = ""
+                        self._active_tool_args = ""
+                        self._scroll_chat_to_end()
                 if event.done:
-                    self._finish_with_assistant()
+                    await self._finish_with_assistant(add_to_history=False)
                     return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - UI 要恢复并展示用户可读错误。
-            self._finish_with_error(exc)
+            await self._finish_with_error(exc)
 
     def _tick(self) -> None:
         if self.state is not SessionState.STREAMING:
             return
         self.turn_elapsed = int(time.monotonic() - self.turn_start)
-        self._refresh_streaming_view()
+        self._working_frame_index = (self._working_frame_index + 1) % len(
+            WORKING_FRAMES
+        )
+        self._update_working()
+        if self._active_tool is not None:
+            self._active_tool.update_renderable(
+                tool_pending(
+                    self._active_tool_name,
+                    self._active_tool_args,
+                    self.turn_elapsed,
+                )
+            )
+            self._scroll_chat_to_end()
 
-    def _finish_with_assistant(self) -> None:
-        elapsed = int(time.monotonic() - self.turn_start)
-        log = self.query_one("#log", RichLog)
-        # RichLog 保留已完成消息；动态区只放当前正在生成的回复。
-        log.write(assistant_markdown(self.cur_reply))
-        log.write(elapsed_block(elapsed))
-        self.conv.add_assistant(self.cur_reply)
-        self._finish_turn()
+    async def _finish_with_assistant(self, add_to_history: bool = True) -> None:
+        if self.cur_reply or self.cur_thinking:
+            await self._update_assistant_live()
+        await self._append_chat(
+            elapsed_block(self._elapsed_seconds()),
+            classes="message elapsed-message",
+        )
+        if add_to_history:
+            self.conv.add_assistant(self.cur_reply)
+        await self._finish_turn()
 
-    def _finish_with_error(self, error: Exception) -> None:
-        log = self.query_one("#log", RichLog)
-        log.write(error_block(error))
-        self._finish_turn()
+    async def _finish_with_error(self, error: Exception) -> None:
+        await self._append_chat(error_block(error), classes="message error-message")
+        await self._finish_turn()
 
-    def _finish_turn(self) -> None:
+    async def _finish_turn(self) -> None:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
         self._stream_task = None
+        self.cur_thinking = ""
         self.cur_reply = ""
+        self._active_assistant = None
+        self._active_tool = None
+        self._active_tool_name = ""
+        self._active_tool_args = ""
+        await self._hide_working()
         self.state = SessionState.IDLE
-        self.query_one("#streaming", Static).update("")
         input_box = self.query_one("#input", ChatInput)
         input_box.disabled = False
-        input_box.focus()
+        self._focus_input()
 
     async def action_quit(self) -> None:
         if self._stream_task is not None and not self._stream_task.done():
             self._stream_task.cancel()
         self.exit()
 
-    def _refresh_streaming_view(self) -> None:
-        seconds = (
-            int(time.monotonic() - self.turn_start)
-            if self.turn_start
-            else self.turn_elapsed
+    def action_toggle_thinking(self) -> None:
+        self.hide_thinking = not self.hide_thinking
+        if self._active_assistant is not None:
+            self._active_assistant.update_renderable(self._assistant_renderable())
+            self._scroll_chat_to_end()
+
+    async def _append_chat(
+        self, renderable: RenderableType, classes: str = "message"
+    ) -> MessageWidget:
+        restore_working = (
+            self._working_widget is not None
+            and "working-message" not in classes.split()
         )
-        text = self.cur_reply or "Imagining..."
-        self.query_one("#streaming", Static).update(
-            Text(f"{text}\nImagining... ({seconds}s)")
+        if restore_working:
+            await self._remove_working()
+
+        widget = MessageWidget(renderable, classes=classes)
+        await self.query_one("#chat", VerticalScroll).mount(widget)
+        if restore_working:
+            await self._show_working()
+        self._scroll_chat_to_end()
+        return widget
+
+    async def _update_assistant_live(self) -> None:
+        renderable = self._assistant_renderable()
+        if self._active_assistant is None:
+            self._active_assistant = await self._append_chat(
+                renderable,
+                classes="message assistant-message",
+            )
+            return
+        self._active_assistant.update_renderable(renderable)
+        self._scroll_chat_to_end()
+
+    def _assistant_renderable(self) -> RenderableType:
+        return assistant_live(self.cur_thinking, self.cur_reply, self.hide_thinking)
+
+    async def _show_working(self) -> None:
+        renderable = working_text(WORKING_FRAMES[self._working_frame_index])
+        if self._working_widget is None:
+            # working 是聊天流的一条临时消息，而不是固定在输入框上方的状态栏；
+            # 新消息追加时会先移除再挂回末尾，从而保持 pi 一样的滚动语义。
+            self._working_widget = MessageWidget(
+                renderable,
+                classes="message working-message",
+            )
+            await self.query_one("#chat", VerticalScroll).mount(self._working_widget)
+        else:
+            self._working_widget.update_renderable(renderable)
+        self._scroll_chat_to_end()
+
+    def _update_working(self) -> None:
+        if self._working_widget is None:
+            return
+        self._working_widget.update_renderable(
+            working_text(WORKING_FRAMES[self._working_frame_index])
         )
+        self._scroll_chat_to_end()
+
+    async def _hide_working(self) -> None:
+        await self._remove_working()
+        self._scroll_chat_to_end()
+
+    async def _remove_working(self) -> None:
+        if self._working_widget is None:
+            return
+        widget = self._working_widget
+        self._working_widget = None
+        await widget.remove()
+
+    def _scroll_chat_to_end(self) -> None:
+        self.query_one("#chat", VerticalScroll).scroll_end(
+            animate=False,
+            immediate=True,
+            force=True,
+        )
+
+    def _focus_input(self) -> None:
+        self.query_one("#input", ChatInput).focus()
+
+    def _elapsed_seconds(self) -> int:
+        return int(time.monotonic() - self.turn_start) if self.turn_start else 0
 
     def _sync_visibility(self) -> None:
         selecting = self.state is SessionState.SELECTING
         self.query_one("#selector", OptionList).display = selecting
-        self.query_one("#log", RichLog).display = not selecting
-        self.query_one("#streaming", Static).display = not selecting
+        self.query_one("#chat", VerticalScroll).display = not selecting
         self.query_one("#input", ChatInput).display = not selecting
         self.query_one("#statusbar", Static).display = not selecting
 
@@ -311,7 +483,7 @@ class AgentCodeApp(App[None]):
         for widget in (
             self.screen,
             self.query_one("#selector", OptionList),
-            self.query_one("#log", RichLog),
+            self.query_one("#chat", VerticalScroll),
         ):
             # ScrollBar.render() 读取父 widget 的 scrollbar_* 样式；这里做运行时兜底，
             # 避免 Textual ANSI 默认蓝色滚动条在真实终端路径覆盖 CSS。

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from rich.text import Text
 
-# 这里刻意声明纯对话能力，防止模型声称自己能执行工具或修改文件。
 SYSTEM_PROMPT = """You are AgentCode, a concise and helpful terminal AI assistant.
-Answer clearly, preserve code formatting, and do not claim to use tools or edit files."""
+You can use tools to read, write, edit files, run shell commands, find files, and search code when needed.
+Use tools when you need current project context or need to perform file/command actions.
+After tool results are provided, answer concisely and preserve code formatting."""
 
 PET_BANNER = r"""
   /\___/\
@@ -28,5 +29,5 @@ def render_banner(version: str, cwd: str) -> Text:
     banner.append("cwd: ", style="dim")
     banner.append(f"{cwd}\n\n", style="cyan")
     banner.append("Ready. ", style="bold green")
-    banner.append("Pure chat mode. No tools. No MCP.\n\n", style="dim")
+    banner.append("Tools enabled. No MCP.\n\n", style="dim")
     return banner

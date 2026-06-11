@@ -12,7 +12,14 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from agentcode.config import ProviderConfig
-from agentcode.llm import Message, StreamEvent
+from agentcode.llm import (
+    ROLE_ASSISTANT,
+    ROLE_TOOL,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+)
 from agentcode.prompt import SYSTEM_PROMPT
 
 
@@ -29,22 +36,36 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._cfg.model
 
-    async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition] | None = None
+    ) -> AsyncIterator[StreamEvent]:
         # OpenAI chat.completions 需要把 system prompt 放进 messages 第一项。
         messages: list[Any] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(_to_openai_message(message) for message in msgs)
+        for message in msgs:
+            messages.extend(_to_openai_messages(message))
+        request: dict[str, Any] = {
+            "model": self._cfg.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            request["tools"] = _to_openai_tools(tools)
 
         try:
             # SDK 已处理 SSE，适配器只负责抽取正文增量并统一成 StreamEvent。
-            stream = await self._client.chat.completions.create(
-                model=self._cfg.model,
-                messages=messages,
-                stream=True,
-            )
+            stream = await self._client.chat.completions.create(**request)
+            tool_calls_buf: dict[int, dict[str, str]] = {}
             async for chunk in stream:
+                _merge_tool_call_deltas(chunk, tool_calls_buf)
+                thinking = _extract_thinking_delta(chunk)
+                if thinking:
+                    yield StreamEvent(thinking=thinking)
                 text = _extract_text_delta(chunk)
                 if text:
                     yield StreamEvent(text=text)
+            calls = _build_tool_calls(tool_calls_buf)
+            if calls:
+                yield StreamEvent(tool_calls=calls)
             yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise
@@ -52,8 +73,49 @@ class OpenAIProvider:
             yield StreamEvent(err=exc)
 
 
-def _to_openai_message(message: Message) -> dict[str, str]:
-    return {"role": message.role, "content": message.content}
+def _to_openai_messages(message: Message) -> list[dict[str, Any]]:
+    if message.role == ROLE_TOOL:
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": result.tool_call_id,
+                "content": result.content,
+            }
+            for result in message.tool_results
+        ]
+    if message.role == ROLE_ASSISTANT and message.tool_calls:
+        return [
+            {
+                "role": "assistant",
+                "content": message.content or None,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.input or "{}",
+                        },
+                    }
+                    for call in message.tool_calls
+                ],
+            }
+        ]
+    return [{"role": message.role, "content": message.content}]
+
+
+def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            },
+        }
+        for tool in tools
+    ]
 
 
 def _new_client(cfg: ProviderConfig) -> AsyncOpenAI:
@@ -69,3 +131,56 @@ def _extract_text_delta(chunk: Any) -> str:
         return ""
     delta = getattr(choices[0], "delta", None)
     return str(getattr(delta, "content", "") or "")
+
+
+def _extract_thinking_delta(chunk: Any) -> str:
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return ""
+    delta = getattr(choices[0], "delta", None)
+    for field in ("reasoning_content", "reasoning", "reasoning_text"):
+        value = getattr(delta, field, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _merge_tool_call_deltas(
+    chunk: Any, tool_calls_buf: dict[int, dict[str, str]]
+) -> None:
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return
+    delta = getattr(choices[0], "delta", None)
+    for fallback_index, tool_call in enumerate(getattr(delta, "tool_calls", []) or []):
+        index = getattr(tool_call, "index", fallback_index)
+        buf = tool_calls_buf.setdefault(index, {})
+        tool_call_id = getattr(tool_call, "id", None)
+        if tool_call_id:
+            buf["id"] = str(tool_call_id)
+        function = getattr(tool_call, "function", None)
+        if function is None:
+            continue
+        name = getattr(function, "name", None)
+        if name:
+            buf["name"] = str(name)
+        arguments = getattr(function, "arguments", None)
+        if arguments:
+            buf["args"] = buf.get("args", "") + str(arguments)
+
+
+def _build_tool_calls(tool_calls_buf: dict[int, dict[str, str]]) -> list[ToolCall]:
+    calls: list[ToolCall] = []
+    for index in sorted(tool_calls_buf):
+        item = tool_calls_buf[index]
+        name = item.get("name")
+        if not name:
+            continue
+        calls.append(
+            ToolCall(
+                id=item.get("id", f"call_{index}"),
+                name=name,
+                input=item.get("args") or "{}",
+            )
+        )
+    return calls

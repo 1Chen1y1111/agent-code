@@ -35,10 +35,12 @@ class CliTests(unittest.TestCase):
         with (
             patch("sys.argv", ["agentcode"]),
             patch("agentcode.cli.load", return_value=config),
-            patch("agentcode.cli.AgentCodeApp", return_value=app),
+            patch("agentcode.cli.new_default_registry", return_value="registry"),
+            patch("agentcode.cli.AgentCodeApp", return_value=app) as app_cls,
         ):
             main()
 
+        app_cls.assert_called_once_with(config.providers, "registry")
         app.run.assert_called_once_with(inline=True, inline_no_clear=True)
 
 

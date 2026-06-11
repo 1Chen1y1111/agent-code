@@ -6,22 +6,57 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Literal, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
 
 from agentcode.config import ProviderConfig
+
+ROLE_USER: Literal["user"] = "user"
+ROLE_ASSISTANT: Literal["assistant"] = "assistant"
+ROLE_TOOL: Literal["tool"] = "tool"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """协议无关的模型工具调用请求。"""
+
+    id: str
+    name: str
+    input: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """协议无关的工具执行结果，用调用 id 与请求配对。"""
+
+    tool_call_id: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    """协议无关的工具定义，由 provider 适配成各 SDK 格式。"""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    role: Literal["user", "assistant"]
-    content: str
+    role: Literal["user", "assistant", "tool"]
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
 class StreamEvent:
-    # 统一流式事件：text/done/err 三类信号由 TUI 按同一套逻辑消费。
+    # thinking 是独立通道，避免把模型推理内容混入最终可见回复。
+    thinking: str = ""
     text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
     done: bool = False
     err: Exception | None = None
 
@@ -34,7 +69,9 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]: ...
+    def stream(
+        self, msgs: list[Message], tools: list[ToolDefinition] | None = None
+    ) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: ProviderConfig) -> Provider:
