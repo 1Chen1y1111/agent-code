@@ -1,4 +1,5 @@
-"""OpenAI 协议适配器。
+"""
+OpenAI 协议适配器。
 
 封装 AsyncOpenAI chat.completions 流式接口，并把文本增量转换为统一 StreamEvent。
 """
@@ -25,20 +26,28 @@ from agentcode.prompt import SYSTEM_PROMPT
 
 class OpenAIProvider:
     def __init__(self, cfg: ProviderConfig, client: Any | None = None) -> None:
+        """保存 OpenAI 配置，并允许测试注入假客户端。"""
+
         self._cfg = cfg
         self._client: Any = client or _new_client(cfg)
 
     @property
     def name(self) -> str:
+        """返回配置中的 provider 展示名。"""
+
         return self._cfg.name
 
     @property
     def model(self) -> str:
+        """返回配置中的 OpenAI 或兼容模型名。"""
+
         return self._cfg.model
 
     async def stream(
         self, msgs: list[Message], tools: list[ToolDefinition] | None = None
     ) -> AsyncIterator[StreamEvent]:
+        """调用 chat.completions 流式接口，并统一文本、thinking 和工具调用事件。"""
+
         # OpenAI chat.completions 需要把 system prompt 放进 messages 第一项。
         messages: list[Any] = [{"role": "system", "content": SYSTEM_PROMPT}]
         for message in msgs:
@@ -74,6 +83,8 @@ class OpenAIProvider:
 
 
 def _to_openai_messages(message: Message) -> list[dict[str, Any]]:
+    """把内部 Message 转成 OpenAI chat.completions 消息片段。"""
+
     if message.role == ROLE_TOOL:
         return [
             {
@@ -105,6 +116,8 @@ def _to_openai_messages(message: Message) -> list[dict[str, Any]]:
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    """把统一工具定义转换成 OpenAI function tool 格式。"""
+
     return [
         {
             "type": "function",
@@ -119,6 +132,8 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 
 
 def _new_client(cfg: ProviderConfig) -> AsyncOpenAI:
+    """创建 AsyncOpenAI 客户端，并支持 OpenAI 兼容 base_url。"""
+
     # base_url 支持 OpenAI 兼容端点，例如代理或第三方兼容服务。
     if cfg.base_url:
         return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
@@ -126,6 +141,8 @@ def _new_client(cfg: ProviderConfig) -> AsyncOpenAI:
 
 
 def _extract_text_delta(chunk: Any) -> str:
+    """从一个 OpenAI 流式 chunk 中提取可见文本增量。"""
+
     choices = getattr(chunk, "choices", None)
     if not choices:
         return ""
@@ -134,6 +151,8 @@ def _extract_text_delta(chunk: Any) -> str:
 
 
 def _extract_thinking_delta(chunk: Any) -> str:
+    """兼容不同 OpenAI-like 字段名，提取 reasoning/thinking 增量。"""
+
     choices = getattr(chunk, "choices", None)
     if not choices:
         return ""
@@ -148,6 +167,8 @@ def _extract_thinking_delta(chunk: Any) -> str:
 def _merge_tool_call_deltas(
     chunk: Any, tool_calls_buf: dict[int, dict[str, str]]
 ) -> None:
+    """把 OpenAI 分片返回的工具名和 JSON 参数碎片合并到缓冲区。"""
+
     choices = getattr(chunk, "choices", None)
     if not choices:
         return
@@ -170,6 +191,8 @@ def _merge_tool_call_deltas(
 
 
 def _build_tool_calls(tool_calls_buf: dict[int, dict[str, str]]) -> list[ToolCall]:
+    """在流结束后把工具调用缓冲区转换为协议无关 ToolCall。"""
+
     calls: list[ToolCall] = []
     for index in sorted(tool_calls_buf):
         item = tool_calls_buf[index]

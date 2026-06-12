@@ -1,4 +1,5 @@
-"""读取文本文件工具。
+"""
+读取文本文件工具。
 
 负责把指定文件内容转成带行号文本；不处理目录递归或二进制语义。
 """
@@ -15,12 +16,18 @@ MAX_READ_LINES = 2000
 
 class ReadFileTool:
     def name(self) -> str:
-        return "read_file"
+        """返回模型调用文件读取能力时使用的工具名。"""
+
+        return "read"
 
     def description(self) -> str:
+        """描述 read 工具读取文本并加行号的输出形态。"""
+
         return "读取指定文本文件内容，返回带行号的文本。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 read 工具需要的文件路径参数 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -30,6 +37,8 @@ class ReadFileTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """读取指定文本文件，目录、缺失文件和读取错误都转成 Result。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)

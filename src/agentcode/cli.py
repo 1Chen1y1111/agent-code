@@ -1,4 +1,5 @@
-"""AgentCode 命令行入口。
+"""
+AgentCode 命令行入口。
 
 负责处理最小启动参数、加载固定配置文件，并把 provider 配置交给 Textual TUI。
 """
@@ -20,6 +21,8 @@ HELP = """Usage: agentcode
 
 
 def main() -> None:
+    """加载配置并以内联模式启动 Textual TUI。"""
+
     # 本期只支持固定 YAML 配置，不提供运行时 flag 覆盖，避免密钥从命令行泄漏。
     if any(arg in {"--help", "-h"} for arg in sys.argv[1:]):
         print(HELP)

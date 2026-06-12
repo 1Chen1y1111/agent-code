@@ -1,4 +1,5 @@
-"""协议无关的 LLM 抽象层。
+"""
+协议无关的 LLM 抽象层。
 
 定义统一消息、流式事件和 Provider 协议，让 TUI 不关心底层是 Anthropic 还是 OpenAI。
 """
@@ -64,17 +65,25 @@ class StreamEvent:
 class Provider(Protocol):
     # 上层只依赖这个协议接口，因此新增后端时不需要改 TUI。
     @property
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """返回用于状态栏展示的 provider 名称。"""
+        ...
 
     @property
-    def model(self) -> str: ...
+    def model(self) -> str:
+        """返回当前 provider 配置的模型标识。"""
+        ...
 
     def stream(
         self, msgs: list[Message], tools: list[ToolDefinition] | None = None
-    ) -> AsyncIterator[StreamEvent]: ...
+    ) -> AsyncIterator[StreamEvent]:
+        """把统一消息和工具定义转换为后端请求，并产出统一流事件。"""
+        ...
 
 
 def new_provider(cfg: ProviderConfig) -> Provider:
+    """根据配置选择具体 Provider 适配器。"""
+
     # 适配器延迟导入，避免未选中的 SDK 在启动时产生额外副作用。
     if cfg.protocol == "anthropic":
         from agentcode.llm.anthropic_provider import AnthropicProvider

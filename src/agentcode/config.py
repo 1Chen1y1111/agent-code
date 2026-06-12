@@ -1,4 +1,5 @@
-"""读取并校验 AgentCode 的 YAML 配置。
+"""
+读取并校验 AgentCode 的 YAML 配置。
 
 本模块只负责启动期配置加载，避免把配置来源、密钥处理和 provider 校验分散到 UI 或 SDK 适配器中。
 """
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-
 
 DEFAULT_CONFIG_PATH = Path(".agentcode/config.yaml")
 Protocol = Literal["anthropic", "openai"]
@@ -37,6 +37,8 @@ class Config:
 
 
 def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
+    """读取 YAML 配置文件并返回启动期可用的结构化配置。"""
+
     # 配置错误需要在启动期变成可读信息，因此这里统一转换为 ConfigError。
     config_path = Path(path)
     if not config_path.exists():
@@ -63,6 +65,8 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
 
 
 def _parse_provider(raw_provider: Any, index: int) -> ProviderConfig:
+    """校验单个 provider 配置，并把普通字符串收窄成内部协议类型。"""
+
     # prefix 会进入错误信息，方便用户定位是哪一项 provider 配错。
     prefix = f"providers[{index}]"
     if not isinstance(raw_provider, dict):
@@ -93,6 +97,8 @@ def _parse_provider(raw_provider: Any, index: int) -> ProviderConfig:
 
 
 def _required_string(raw_provider: dict[str, Any], field_name: str, prefix: str) -> str:
+    """读取必填字符串字段，并统一处理空值报错。"""
+
     value = raw_provider.get(field_name)
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{prefix}.{field_name} 不能为空")

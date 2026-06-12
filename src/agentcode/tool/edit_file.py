@@ -1,4 +1,5 @@
-"""精确替换文本文件工具。
+"""
+精确替换文本文件工具。
 
 负责把文件中的唯一旧片段替换为新片段；匹配不唯一时拒绝修改。
 """
@@ -12,12 +13,18 @@ from agentcode.tool import Result, _load_json_object
 
 class EditFileTool:
     def name(self) -> str:
-        return "edit_file"
+        """返回模型调用精确文本替换能力时使用的工具名。"""
+
+        return "edit"
 
     def description(self) -> str:
+        """描述 edit 工具基于唯一旧文本替换的约束。"""
+
         return "在文本文件中用 new_string 替换唯一匹配的 old_string。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 edit 工具的路径、旧文本和新文本参数 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -32,6 +39,8 @@ class EditFileTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """按唯一匹配规则修改文件，不唯一或缺失时返回可重试错误。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)

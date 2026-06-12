@@ -1,6 +1,8 @@
 # AgentCode
 
-AgentCode 是一个 Claude Code 风格的终端 AI 客户端。当前阶段只支持纯文本多轮对话，不支持 tool use、MCP、权限系统、文件操作、代码编辑或会话持久化。
+AgentCode 是一个 Claude Code 风格的终端 AI 客户端。当前阶段支持纯文本多轮对话、OpenAI/Anthropic 流式输出、Claude extended thinking，以及一轮工具调用回灌。
+
+当前内置工具为 `read`、`write`、`edit`、`bash`、`find`、`grep`。自动多轮 Agent Loop、MCP、权限系统和会话持久化暂未实现。
 
 ## 启动
 

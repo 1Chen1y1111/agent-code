@@ -1,4 +1,5 @@
-"""文件模式匹配工具。
+"""
+文件模式匹配工具。
 
 负责按 glob 模式列出文件路径；只返回文件，不返回目录。
 """
@@ -15,12 +16,18 @@ MAX_MATCHES = 100
 
 class GlobTool:
     def name(self) -> str:
-        return "glob"
+        """返回模型调用文件查找能力时使用的工具名。"""
+
+        return "find"
 
     def description(self) -> str:
+        """描述 find 工具按 glob 模式返回文件路径的行为。"""
+
         return "按 glob 模式查找匹配的文件路径。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 find 工具的匹配模式和可选根目录 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -37,6 +44,8 @@ class GlobTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """执行文件路径匹配，并限制返回数量避免撑爆上下文。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)

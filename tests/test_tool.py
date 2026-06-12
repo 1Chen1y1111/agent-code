@@ -17,14 +17,14 @@ async def test_registry_exports_default_tools_in_order() -> None:
     definitions = registry.definitions()
 
     assert [definition.name for definition in definitions] == [
-        "read_file",
-        "write_file",
-        "edit_file",
+        "read",
         "bash",
-        "glob",
+        "edit",
+        "write",
+        "find",
         "grep",
     ]
-    assert registry.get("read_file") is not None
+    assert registry.get("read") is not None
     assert registry.get("missing") is None
     result = await registry.execute("missing", "{}")
     assert result.is_error
@@ -150,7 +150,7 @@ async def test_glob_matches_python_files() -> None:
     registry = new_default_registry()
 
     result = await registry.execute(
-        "glob", json.dumps({"pattern": "**/*.py", "path": "src/agentcode"})
+        "find", json.dumps({"pattern": "**/*.py", "path": "src/agentcode"})
     )
 
     assert not result.is_error

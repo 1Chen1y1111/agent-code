@@ -1,4 +1,5 @@
-"""AgentCode 的 Textual TUI 主应用。
+"""
+AgentCode 的 Textual TUI 主应用。
 
 负责 provider 选择、对话状态机、流式消费、计时展示和自绘聊天输入框。
 """
@@ -19,11 +20,10 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from agentcode import __version__
-from agentcode.agent import Agent, Phase
 from agentcode.config import ProviderConfig
-from agentcode.conversation import Conversation
-from agentcode.llm import Provider, new_provider
+from agentcode.llm import ROLE_USER, Provider, new_provider
 from agentcode.prompt import render_banner
+from agentcode.session import AgentSession
 from agentcode.tool import Registry, new_default_registry
 from agentcode.tui.input import ChatInput
 from agentcode.tui.scrollbar import install_scrollbar_renderer
@@ -37,7 +37,6 @@ from agentcode.tui.view import (
     user_block,
     working_text,
 )
-
 
 WORKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -53,10 +52,14 @@ class MessageWidget(Static):
     """聊天消息组件，保留原始 Rich renderable 以便原地更新和测试观察。"""
 
     def __init__(self, renderable: RenderableType, classes: str) -> None:
+        """保存初始 Rich renderable，便于后续原地刷新和测试读取。"""
+
         super().__init__(renderable, classes=classes)
         self.renderable = renderable
 
     def update_renderable(self, renderable: RenderableType) -> None:
+        """同时更新缓存的 renderable 和 Textual widget 内容。"""
+
         self.renderable = renderable
         self.update(renderable)
 
@@ -162,13 +165,16 @@ class AgentCodeApp(App[None]):
     def __init__(
         self, providers: list[ProviderConfig], registry: Registry | None = None
     ) -> None:
+        """初始化 TUI 状态，并注入 provider 配置和工具注册中心。"""
+
         super().__init__()
         install_scrollbar_renderer()
         self.providers = providers
         self._tool_registry = registry or new_default_registry()
         self.provider: Provider | None = None
+        self.agent_session: AgentSession | None = None
+        self._agent_session_provider: Provider | None = None
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
-        self.conv = Conversation()
         self.cur_thinking = ""
         self.cur_reply = ""
         self.hide_thinking = False
@@ -184,6 +190,8 @@ class AgentCodeApp(App[None]):
         self._timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
+        """声明 Textual 组件树：provider 选择器、聊天区、输入框和状态栏。"""
+
         yield OptionList(
             *[
                 Option(f"{provider.name} ({provider.model})")
@@ -200,6 +208,8 @@ class AgentCodeApp(App[None]):
         yield Static("", id="statusbar")
 
     async def on_mount(self) -> None:
+        """Textual 挂载完成后初始化 banner、provider 选择状态和焦点。"""
+
         # banner 作为第一条消息挂入聊天容器；后续 View 刷新不会重复渲染。
         await self._append_chat(
             render_banner(__version__, str(Path.cwd())),
@@ -207,6 +217,7 @@ class AgentCodeApp(App[None]):
         )
         if len(self.providers) == 1:
             self.provider = new_provider(self.providers[0])
+            self._ensure_agent_session()
             self.state = SessionState.IDLE
         self._sync_visibility()
         self._apply_scrollbar_theme()
@@ -219,7 +230,10 @@ class AgentCodeApp(App[None]):
     async def on_option_list_option_selected(
         self, event: OptionList.OptionSelected
     ) -> None:
+        """用户选中 provider 后创建会话并切换到聊天界面。"""
+
         self.provider = new_provider(self.providers[event.option_index])
+        self._ensure_agent_session()
         self.state = SessionState.IDLE
         self._sync_visibility()
         self._apply_scrollbar_theme()
@@ -228,9 +242,13 @@ class AgentCodeApp(App[None]):
         self.call_after_refresh(self._focus_input)
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+        """接收自绘输入框的提交事件并交给统一提交入口。"""
+
         await self.submit(event.text)
 
     async def submit(self, text: str) -> None:
+        """提交一条用户消息，启动本回合的 session 事件消费任务。"""
+
         message = text.strip()
         if not message or self.state is not SessionState.IDLE:
             return
@@ -241,8 +259,8 @@ class AgentCodeApp(App[None]):
             return
 
         input_box = self.query_one("#input", ChatInput)
-        self.conv.add_user(message)
-        await self._append_chat(user_block(message), classes="message user-message")
+        if self._ensure_agent_session() is None:
+            return
         input_box.add_history(message)
         input_box.load_text("")
         # 流式期间不接受新提交，但 Textual 事件循环仍继续运行。
@@ -261,61 +279,71 @@ class AgentCodeApp(App[None]):
         await self._show_working()
         # 计时器从请求发出前启动，覆盖“等待首 token”的时间。
         self._timer = self.set_interval(0.1, self._tick)
-        self._stream_task = asyncio.create_task(self._consume_agent_events())
+        self._stream_task = asyncio.create_task(self._consume_session_events(message))
 
-    async def _consume_agent_events(self) -> None:
-        if self.provider is None:
+    async def _consume_session_events(self, message: str) -> None:
+        """消费 AgentSession 事件，并转换成聊天流中的可见 UI 更新。"""
+
+        session = self._ensure_agent_session()
+        if session is None:
             return
         try:
-            agent = Agent(self.provider, self._tool_registry)
-            async for event in agent.run(self.conv):
-                if event.err is not None:
+            async for event in session.prompt(message):
+                if event.type == "error" and event.err is not None:
                     await self._finish_with_error(event.err)
                     return
-                if event.thinking:
+                if (
+                    event.type == "message_end"
+                    and event.message is not None
+                    and event.message.role == ROLE_USER
+                ):
+                    await self._append_chat(
+                        user_block(event.message.content),
+                        classes="message user-message",
+                    )
+                if event.type == "message_update" and event.thinking:
                     self.cur_thinking += event.thinking
                     await self._update_assistant_live()
-                if event.text:
+                if event.type == "message_update" and event.text:
                     self.cur_reply += event.text
                     await self._update_assistant_live()
-                if event.tool is not None:
-                    if event.tool.phase is Phase.START:
-                        # 工具调用会切开 assistant 回合：前言留在消息流里，
-                        # 后续最终答复会创建新的 assistant live widget。
-                        self.cur_thinking = ""
-                        self.cur_reply = ""
-                        self._active_assistant = None
-                        self._active_tool_name = event.tool.name
-                        self._active_tool_args = event.tool.args
-                        self._active_tool = await self._append_chat(
-                            tool_pending(
-                                event.tool.name,
-                                event.tool.args,
-                                self._elapsed_seconds(),
-                            ),
+                if event.type == "tool_execution_start":
+                    # 工具调用会切开 assistant 回合：前言留在消息流里，
+                    # 后续最终答复会创建新的 assistant live widget。
+                    self.cur_thinking = ""
+                    self.cur_reply = ""
+                    self._active_assistant = None
+                    self._active_tool_name = event.tool_name
+                    self._active_tool_args = event.args
+                    self._active_tool = await self._append_chat(
+                        tool_pending(
+                            event.tool_name,
+                            event.args,
+                            self._elapsed_seconds(),
+                        ),
+                        classes="message tool-message",
+                    )
+                if event.type == "tool_execution_end":
+                    tool_widget = self._active_tool
+                    if tool_widget is None:
+                        tool_widget = await self._append_chat(
+                            "",
                             classes="message tool-message",
                         )
-                    elif event.tool.phase is Phase.END:
-                        tool_widget = self._active_tool
-                        if tool_widget is None:
-                            tool_widget = await self._append_chat(
-                                "",
-                                classes="message tool-message",
-                            )
-                        tool_widget.update_renderable(
-                            tool_done(
-                                event.tool.name,
-                                event.tool.args,
-                                event.tool.result,
-                                event.tool.is_error,
-                            )
+                    tool_widget.update_renderable(
+                        tool_done(
+                            event.tool_name,
+                            event.args,
+                            event.result,
+                            event.is_error,
                         )
-                        self._active_tool = None
-                        self._active_tool_name = ""
-                        self._active_tool_args = ""
-                        self._scroll_chat_to_end()
-                if event.done:
-                    await self._finish_with_assistant(add_to_history=False)
+                    )
+                    self._active_tool = None
+                    self._active_tool_name = ""
+                    self._active_tool_args = ""
+                    self._scroll_chat_to_end()
+                if event.type == "agent_end":
+                    await self._finish_with_assistant()
                     return
         except asyncio.CancelledError:
             raise
@@ -323,6 +351,8 @@ class AgentCodeApp(App[None]):
             await self._finish_with_error(exc)
 
     def _tick(self) -> None:
+        """定时刷新回合耗时、spinner 和正在执行的工具状态。"""
+
         if self.state is not SessionState.STREAMING:
             return
         self.turn_elapsed = int(time.monotonic() - self.turn_start)
@@ -340,22 +370,26 @@ class AgentCodeApp(App[None]):
             )
             self._scroll_chat_to_end()
 
-    async def _finish_with_assistant(self, add_to_history: bool = True) -> None:
+    async def _finish_with_assistant(self) -> None:
+        """在正常结束时补齐最终助手消息、耗时块并恢复输入状态。"""
+
         if self.cur_reply or self.cur_thinking:
             await self._update_assistant_live()
         await self._append_chat(
             elapsed_block(self._elapsed_seconds()),
             classes="message elapsed-message",
         )
-        if add_to_history:
-            self.conv.add_assistant(self.cur_reply)
         await self._finish_turn()
 
     async def _finish_with_error(self, error: Exception) -> None:
+        """在流式请求或工具链路失败时显示错误并恢复输入状态。"""
+
         await self._append_chat(error_block(error), classes="message error-message")
         await self._finish_turn()
 
     async def _finish_turn(self) -> None:
+        """清理当前回合的临时 UI 状态并重新允许用户输入。"""
+
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
@@ -373,11 +407,15 @@ class AgentCodeApp(App[None]):
         self._focus_input()
 
     async def action_quit(self) -> None:
+        """处理退出快捷键，并取消仍在运行的流式任务。"""
+
         if self._stream_task is not None and not self._stream_task.done():
             self._stream_task.cancel()
         self.exit()
 
     def action_toggle_thinking(self) -> None:
+        """切换当前流式助手消息中的 thinking 展示状态。"""
+
         self.hide_thinking = not self.hide_thinking
         if self._active_assistant is not None:
             self._active_assistant.update_renderable(self._assistant_renderable())
@@ -386,6 +424,8 @@ class AgentCodeApp(App[None]):
     async def _append_chat(
         self, renderable: RenderableType, classes: str = "message"
     ) -> MessageWidget:
+        """向聊天容器追加消息，并保持 working 临时消息始终位于末尾。"""
+
         restore_working = (
             self._working_widget is not None
             and "working-message" not in classes.split()
@@ -401,6 +441,8 @@ class AgentCodeApp(App[None]):
         return widget
 
     async def _update_assistant_live(self) -> None:
+        """创建或刷新当前正在流式输出的助手消息。"""
+
         renderable = self._assistant_renderable()
         if self._active_assistant is None:
             self._active_assistant = await self._append_chat(
@@ -412,9 +454,13 @@ class AgentCodeApp(App[None]):
         self._scroll_chat_to_end()
 
     def _assistant_renderable(self) -> RenderableType:
+        """根据当前 thinking/text 缓冲生成助手消息 renderable。"""
+
         return assistant_live(self.cur_thinking, self.cur_reply, self.hide_thinking)
 
     async def _show_working(self) -> None:
+        """显示或刷新聊天流末尾的 Working 临时消息。"""
+
         renderable = working_text(WORKING_FRAMES[self._working_frame_index])
         if self._working_widget is None:
             # working 是聊天流的一条临时消息，而不是固定在输入框上方的状态栏；
@@ -429,6 +475,8 @@ class AgentCodeApp(App[None]):
         self._scroll_chat_to_end()
 
     def _update_working(self) -> None:
+        """只刷新已存在的 Working 临时消息。"""
+
         if self._working_widget is None:
             return
         self._working_widget.update_renderable(
@@ -437,10 +485,14 @@ class AgentCodeApp(App[None]):
         self._scroll_chat_to_end()
 
     async def _hide_working(self) -> None:
+        """隐藏 Working 临时消息并保持滚动到底部。"""
+
         await self._remove_working()
         self._scroll_chat_to_end()
 
     async def _remove_working(self) -> None:
+        """从聊天容器移除 Working 临时消息。"""
+
         if self._working_widget is None:
             return
         widget = self._working_widget
@@ -448,6 +500,8 @@ class AgentCodeApp(App[None]):
         await widget.remove()
 
     def _scroll_chat_to_end(self) -> None:
+        """无动画滚动到聊天容器底部，匹配流式输出语义。"""
+
         self.query_one("#chat", VerticalScroll).scroll_end(
             animate=False,
             immediate=True,
@@ -455,12 +509,31 @@ class AgentCodeApp(App[None]):
         )
 
     def _focus_input(self) -> None:
+        """把焦点放回自绘输入框。"""
+
         self.query_one("#input", ChatInput).focus()
 
     def _elapsed_seconds(self) -> int:
+        """返回当前回合从提交到现在的整数秒耗时。"""
+
         return int(time.monotonic() - self.turn_start) if self.turn_start else 0
 
+    def _ensure_agent_session(self) -> AgentSession | None:
+        """确保当前 provider 对应的进程内 AgentSession 已创建。"""
+
+        if self.provider is None:
+            return None
+        if (
+            self.agent_session is None
+            or self._agent_session_provider is not self.provider
+        ):
+            self.agent_session = AgentSession(self.provider, self._tool_registry)
+            self._agent_session_provider = self.provider
+        return self.agent_session
+
     def _sync_visibility(self) -> None:
+        """根据当前状态切换 provider 选择界面和聊天界面的显示。"""
+
         selecting = self.state is SessionState.SELECTING
         self.query_one("#selector", OptionList).display = selecting
         self.query_one("#chat", VerticalScroll).display = not selecting
@@ -468,6 +541,8 @@ class AgentCodeApp(App[None]):
         self.query_one("#statusbar", Static).display = not selecting
 
     def _update_statusbar(self) -> None:
+        """把当前 provider 和 model 写入底部状态栏。"""
+
         statusbar = self.query_one("#statusbar", Static)
         if self.provider is None:
             statusbar.update("")
@@ -475,6 +550,8 @@ class AgentCodeApp(App[None]):
             statusbar.update(status_text(self.provider.name, self.provider.model))
 
     def _apply_scrollbar_theme(self) -> None:
+        """运行时兜底设置滚动条主题，避免真实终端路径覆盖 CSS。"""
+
         track = Color.parse("transparent")
         thumb = Color.parse("#a7a7b3")
         thumb_hover = Color.parse("#b8b8c4")

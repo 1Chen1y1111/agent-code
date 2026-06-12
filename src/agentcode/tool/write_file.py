@@ -1,4 +1,5 @@
-"""写入文本文件工具。
+"""
+写入文本文件工具。
 
 负责创建父目录并覆盖写入指定文本；不做权限确认或路径沙箱限制。
 """
@@ -12,12 +13,18 @@ from agentcode.tool import Result, _load_json_object
 
 class WriteFileTool:
     def name(self) -> str:
-        return "write_file"
+        """返回模型调用文件写入能力时使用的工具名。"""
+
+        return "write"
 
     def description(self) -> str:
+        """描述 write 工具完整覆盖写入文件的行为。"""
+
         return "创建或覆盖写入指定文本文件，父目录不存在时自动创建。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 write 工具的目标路径和完整内容参数 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -28,6 +35,8 @@ class WriteFileTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """创建父目录后写入完整内容，并把写入失败转为工具错误。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)

@@ -1,4 +1,5 @@
-"""Anthropic 协议适配器。
+"""
+Anthropic 协议适配器。
 
 封装 AsyncAnthropic 的流式 messages API，并把 SDK 事件转换为统一 StreamEvent。
 """
@@ -23,27 +24,34 @@ from agentcode.llm import (
 )
 from agentcode.prompt import SYSTEM_PROMPT
 
-
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_THINKING_BUDGET_TOKENS = 2048
 
 
 class AnthropicProvider:
     def __init__(self, cfg: ProviderConfig, client: Any | None = None) -> None:
+        """保存 Anthropic 配置，并允许测试注入假客户端。"""
+
         self._cfg = cfg
         self._client: Any = client or _new_client(cfg)
 
     @property
     def name(self) -> str:
+        """返回配置中的 provider 展示名。"""
+
         return self._cfg.name
 
     @property
     def model(self) -> str:
+        """返回配置中的 Anthropic 模型名。"""
+
         return self._cfg.model
 
     async def stream(
         self, msgs: list[Message], tools: list[ToolDefinition] | None = None
     ) -> AsyncIterator[StreamEvent]:
+        """调用 Anthropic messages stream，并统一文本、thinking 和工具调用事件。"""
+
         # system prompt 由适配器注入，Conversation 只保存 user/assistant 历史。
         request: dict[str, Any] = {
             "model": self._cfg.model,
@@ -83,6 +91,8 @@ class AnthropicProvider:
 
 
 def _to_anthropic_message(message: Message) -> dict[str, Any]:
+    """把内部 Message 转成 Anthropic messages API 的消息结构。"""
+
     if message.role == ROLE_TOOL:
         return {
             "role": "user",
@@ -114,6 +124,8 @@ def _to_anthropic_message(message: Message) -> dict[str, Any]:
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    """把统一工具定义转换成 Anthropic tool_use 可识别的格式。"""
+
     return [
         {
             "name": tool.name,
@@ -125,6 +137,8 @@ def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 
 
 def _new_client(cfg: ProviderConfig) -> AsyncAnthropic:
+    """创建 AsyncAnthropic 客户端，并支持兼容 base_url。"""
+
     # base_url 为空时走官方默认端点；非空时接兼容服务。
     if cfg.base_url:
         return AsyncAnthropic(api_key=cfg.api_key, base_url=cfg.base_url)
@@ -132,12 +146,16 @@ def _new_client(cfg: ProviderConfig) -> AsyncAnthropic:
 
 
 def _extract_text_delta(event: Any) -> str:
+    """只从 Anthropic helper text 事件提取可见文本，避免重复 token。"""
+
     if getattr(event, "type", None) != "text":
         return ""
     return str(getattr(event, "text", "") or "")
 
 
 def _extract_thinking_delta(event: Any) -> str:
+    """从 Anthropic content block delta 中提取 extended thinking 内容。"""
+
     event_type = getattr(event, "type", None)
     if event_type == "content_block_start":
         block = getattr(event, "content_block", None)
@@ -153,6 +171,8 @@ def _extract_thinking_delta(event: Any) -> str:
 
 
 async def _extract_tool_calls(stream: Any) -> list[ToolCall]:
+    """读取 Anthropic 最终消息，并抽取 stop_reason=tool_use 的工具调用。"""
+
     get_final_message = getattr(stream, "get_final_message", None)
     if get_final_message is None:
         return []
@@ -175,6 +195,8 @@ async def _extract_tool_calls(stream: Any) -> list[ToolCall]:
 
 
 def _json_object(raw: str) -> dict[str, Any]:
+    """把工具参数字符串解析为对象，解析失败时给 Anthropic 一个空对象。"""
+
     try:
         value = json.loads(raw or "{}")
     except json.JSONDecodeError:
@@ -183,4 +205,6 @@ def _json_object(raw: str) -> dict[str, Any]:
 
 
 def _has_tool_history(msgs: list[Message]) -> bool:
+    """判断历史中是否已有工具消息，用于决定是否禁用 thinking replay。"""
+
     return any(message.tool_calls or message.tool_results for message in msgs)

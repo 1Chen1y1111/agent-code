@@ -84,7 +84,7 @@ class AnthropicProviderTests(unittest.TestCase):
                 SimpleNamespace(
                     type="tool_use",
                     id="call_1",
-                    name="read_file",
+                    name="read",
                     input={"path": "spec.md"},
                 )
             ],
@@ -106,7 +106,7 @@ class AnthropicProviderTests(unittest.TestCase):
             request["tools"],
             [
                 {
-                    "name": "read_file",
+                    "name": "read",
                     "description": "Read file",
                     "input_schema": {
                         "type": "object",
@@ -118,12 +118,12 @@ class AnthropicProviderTests(unittest.TestCase):
         )
         self.assertEqual(
             [event.tool_calls for event in chunks if event.tool_calls],
-            [[ToolCall(id="call_1", name="read_file", input='{"path": "spec.md"}')]],
+            [[ToolCall(id="call_1", name="read", input='{"path": "spec.md"}')]],
         )
         self.assertTrue(chunks[-1].done)
 
     def test_stream_maps_tool_history_and_disables_thinking(self) -> None:
-        call = ToolCall(id="call_1", name="read_file", input='{"path":"spec.md"}')
+        call = ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')
         result = ToolResult(tool_call_id="call_1", content="content", is_error=False)
         fake_client = FakeAnthropicClient([])
         provider = AnthropicProvider(
@@ -154,7 +154,7 @@ class AnthropicProviderTests(unittest.TestCase):
                         {
                             "type": "tool_use",
                             "id": "call_1",
-                            "name": "read_file",
+                            "name": "read",
                             "input": {"path": "spec.md"},
                         },
                     ],
@@ -245,7 +245,7 @@ class OpenAIProviderTests(unittest.TestCase):
                                         index=0,
                                         id="call_1",
                                         function=SimpleNamespace(
-                                            name="read_file",
+                                            name="read",
                                             arguments='{"path"',
                                         ),
                                     )
@@ -293,7 +293,7 @@ class OpenAIProviderTests(unittest.TestCase):
                 {
                     "type": "function",
                     "function": {
-                        "name": "read_file",
+                        "name": "read",
                         "description": "Read file",
                         "parameters": {
                             "type": "object",
@@ -306,12 +306,12 @@ class OpenAIProviderTests(unittest.TestCase):
         )
         self.assertEqual(
             [event.tool_calls for event in chunks if event.tool_calls],
-            [[ToolCall(id="call_1", name="read_file", input='{"path":"spec.md"}')]],
+            [[ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')]],
         )
         self.assertTrue(chunks[-1].done)
 
     def test_stream_maps_tool_history(self) -> None:
-        call = ToolCall(id="call_1", name="read_file", input='{"path":"spec.md"}')
+        call = ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')
         result = ToolResult(tool_call_id="call_1", content="content", is_error=False)
         fake_client = FakeOpenAIClient([])
         provider = OpenAIProvider(_cfg("openai"), client=fake_client)
@@ -341,7 +341,7 @@ class OpenAIProviderTests(unittest.TestCase):
                             "id": "call_1",
                             "type": "function",
                             "function": {
-                                "name": "read_file",
+                                "name": "read",
                                 "arguments": '{"path":"spec.md"}',
                             },
                         }
@@ -463,7 +463,7 @@ def _cfg(
 
 def _tool_definition() -> ToolDefinition:
     return ToolDefinition(
-        name="read_file",
+        name="read",
         description="Read file",
         input_schema={
             "type": "object",

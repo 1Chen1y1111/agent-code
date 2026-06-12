@@ -34,7 +34,7 @@ class ConversationTests(unittest.TestCase):
 
     def test_adds_tool_messages_in_order(self) -> None:
         conversation = Conversation()
-        call = ToolCall(id="call_1", name="read_file", input='{"path":"spec.md"}')
+        call = ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')
         result = ToolResult(
             tool_call_id="call_1", content="file content", is_error=False
         )

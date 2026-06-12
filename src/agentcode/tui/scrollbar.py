@@ -1,4 +1,5 @@
-"""TUI 自定义滚动条渲染器。
+"""
+TUI 自定义滚动条渲染器。
 
 Textual 默认滚动条是硬块字符；这里用单列宽度和上下半块字符模拟 macOS
 Chrome 那种无可见轨道、只有圆角 thumb 的悬浮滚动条。
@@ -29,6 +30,8 @@ class PillScrollBarRender(ScrollBarRender):
         back_color: Color = Color.parse("#444252"),
         bar_color: Color = Color.parse("#a7a7b3"),
     ) -> Segments:
+        """按 Textual 的滚动条协议生成一列胶囊形滚动条段。"""
+
         if not vertical:
             return super().render_bar(
                 size,
@@ -76,6 +79,8 @@ def install_scrollbar_renderer() -> None:
 
 
 def _thumb_size(size: int, virtual_size: float, window_size: float) -> int:
+    """按可视窗口比例计算 thumb 高度，并保证小窗口仍可见。"""
+
     proportional = ceil(size * min(window_size / virtual_size, 1))
     minimum = 3 if size >= 3 else 1
     return max(minimum, min(size, proportional))
@@ -88,14 +93,20 @@ def _thumb_start(
     position: float,
     thumb_size: int,
 ) -> int:
+    """把滚动位置映射为 thumb 在可见滚动条中的起始行。"""
+
     max_position = max(virtual_size - window_size, 1)
     max_start = max(size - thumb_size, 0)
     return max(0, min(max_start, round(max_start * position / max_position)))
 
 
 def _top_cap(width: int) -> str:
+    """生成 thumb 顶部半块字符，模拟圆角上沿。"""
+
     return "▄" * width
 
 
 def _bottom_cap(width: int) -> str:
+    """生成 thumb 底部半块字符，模拟圆角下沿。"""
+
     return "▀" * width

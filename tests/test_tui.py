@@ -156,7 +156,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.3)
 
             self.assertEqual(
-                [(message.role, message.content) for message in app.conv.messages()],
+                [(message.role, message.content) for message in _messages(app)],
                 [("user", "hi"), ("assistant", "ok")],
             )
             self.assertEqual(input_box.text, "")
@@ -171,7 +171,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_events_render_inline_in_chat(self) -> None:
         registry = Registry()
-        registry.register(FakeTool("read_file", "file content"))
+        registry.register(FakeTool("read", "file content"))
         app = AgentCodeApp([_provider("Only", "openai")], registry=registry)
 
         async with app.run_test() as pilot:
@@ -182,7 +182,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                             tool_calls=[
                                 ToolCall(
                                     id="call_1",
-                                    name="read_file",
+                                    name="read",
                                     input='{"path":"note.txt"}',
                                 )
                             ]
@@ -200,7 +200,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
             chat_text = _chat_text(app)
             self.assertIn("● read", chat_text)
-            self.assertIn("read_file", chat_text)
+            self.assertIn('read({"path":"note.txt"})', chat_text)
             self.assertIn("file content", chat_text)
             self.assertIn("done", chat_text)
 
@@ -226,7 +226,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             chat_text = _chat_text(app)
             self.assertIn("先分析边界", chat_text)
             self.assertIn("最终答案", chat_text)
-            self.assertEqual(app.conv.messages()[-1].content, "最终答案")
+            self.assertEqual(_messages(app)[-1].content, "最终答案")
 
     async def test_ctrl_t_hides_streaming_thinking_block(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -306,7 +306,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_working_indicator_stays_visible_during_tool_execution(self) -> None:
         registry = Registry()
-        tool = BlockingTool("read_file", "file content")
+        tool = BlockingTool("read", "file content")
         registry.register(tool)
         app = AgentCodeApp([_provider("Only", "openai")], registry=registry)
 
@@ -318,7 +318,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                             tool_calls=[
                                 ToolCall(
                                     id="call_1",
-                                    name="read_file",
+                                    name="read",
                                     input='{"path":"note.txt"}',
                                 )
                             ]
@@ -369,7 +369,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
 
             self.assertEqual(input_box.text, "h\ni")
-            self.assertEqual(app.conv.messages(), [])
+            self.assertEqual(_messages(app), [])
 
     async def test_cursor_inserts_text_in_middle(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -840,6 +840,11 @@ def _chat_text(app: AgentCodeApp) -> str:
     for widget in app.query_one("#chat", VerticalScroll).query(Static):
         console.print(getattr(widget, "renderable", widget.render()))
     return console.export_text()
+
+
+def _messages(app: AgentCodeApp) -> list[Message]:
+    assert app.agent_session is not None
+    return app.agent_session.messages()
 
 
 def _working_widgets(app: AgentCodeApp) -> list[Static]:

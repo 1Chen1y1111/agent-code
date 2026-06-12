@@ -1,4 +1,5 @@
-"""AgentCode 的自绘聊天输入框。
+"""
+AgentCode 的自绘聊天输入框。
 
 负责输入缓冲、光标编辑、历史输入、粘贴折叠、中文 IME/CSI-u 解码，
 以及同步真实终端光标给输入法。
@@ -28,10 +29,14 @@ class ChatInput(Static, can_focus=True):
         """用户按 Enter 提交输入框内容。"""
 
         def __init__(self, text: str) -> None:
+            """保存提交时要交给 TUI 主应用的完整文本。"""
+
             self.text = text
             super().__init__()
 
     def __init__(self, text: str = "", *, placeholder: str = "", **kwargs: Any) -> None:
+        """初始化输入缓冲、光标位置、历史导航和粘贴占位状态。"""
+
         super().__init__("", **kwargs)
         self._text = text
         self._cursor_index = len(text)
@@ -45,15 +50,21 @@ class ChatInput(Static, can_focus=True):
 
     @property
     def text(self) -> str:
+        """返回当前屏幕上显示的输入框文本。"""
+
         return self._text
 
     def submitted_text(self) -> str:
+        """返回提交给模型的文本，会把大段粘贴占位符还原成原文。"""
+
         text = self._text
         for marker, original in self._paste_chunks.items():
             text = text.replace(marker, original)
         return text
 
     def add_history(self, text: str) -> None:
+        """把成功提交的文本加入历史，并去掉连续重复项。"""
+
         if not text or (self._history and self._history[-1] == text):
             self._reset_history_navigation()
             return
@@ -63,18 +74,26 @@ class ChatInput(Static, can_focus=True):
         self._reset_history_navigation()
 
     def on_mount(self) -> None:
+        """组件挂载后立即渲染初始占位符或文本。"""
+
         self._refresh_display()
 
     def on_focus(self) -> None:
+        """获得焦点时显示硬件光标并同步 IME 候选框位置。"""
+
         self._set_terminal_cursor_visible(True)
         self._refresh_display()
         self._sync_terminal_cursor_position()
 
     def on_blur(self) -> None:
+        """失去焦点时隐藏硬件光标并刷新输入框样式。"""
+
         self._set_terminal_cursor_visible(False)
         self._refresh_display()
 
     def focus(self, scroll_visible: bool = True) -> Self:
+        """程序主动聚焦输入框时同步 Textual 状态和真实终端光标。"""
+
         # Textual 已经聚焦时不会再次触发 on_focus，因此重写 focus 保证程序聚焦也同步光标。
         focused = super().focus(scroll_visible)
         self._set_terminal_cursor_visible(not self.disabled)
@@ -82,34 +101,48 @@ class ChatInput(Static, can_focus=True):
         return focused
 
     def on_click(self) -> None:
+        """鼠标点击输入框时获取焦点并同步光标位置。"""
+
         self.focus()
         self._refresh_display()
         self._sync_terminal_cursor_position()
 
     def focus_on_click(self) -> bool:
+        """告诉 Textual 该组件点击后应获得焦点。"""
+
         return True
 
     def watch_disabled(self, disabled: bool) -> None:
+        """输入框禁用状态变化时同步硬件光标和显示内容。"""
+
         self._set_terminal_cursor_visible(self.has_focus and not disabled)
         self._refresh_display()
         self._sync_terminal_cursor_position()
 
     def load_text(self, text: str) -> None:
+        """用新文本替换当前输入，并清空粘贴占位和历史导航状态。"""
+
         self._set_text(text, clear_pastes=True)
         self._reset_history_navigation()
         self._refresh_display()
         self._sync_terminal_cursor_position()
 
     def insert(self, text: str) -> None:
+        """在当前光标处插入文本，并退出历史浏览状态。"""
+
         self._reset_history_navigation()
         self._insert_at_cursor(text)
 
     def on_paste(self, event: events.Paste) -> None:
+        """接管 Textual 粘贴事件，以便大段内容折叠成占位符。"""
+
         event.prevent_default()
         event.stop()
         self._handle_paste(event.text)
 
     async def _on_key(self, event: events.Key) -> None:
+        """处理键盘编辑、提交、历史导航和可打印字符输入。"""
+
         if event.key in {"alt+enter", "meta+enter"}:
             event.prevent_default()
             event.stop()
@@ -193,6 +226,8 @@ class ChatInput(Static, can_focus=True):
         *,
         clear_pastes: bool = False,
     ) -> None:
+        """设置内部文本缓冲和字符光标索引，可选择清空粘贴映射。"""
+
         self._text = text
         self._cursor_index = (
             len(text) if cursor_index is None else self._clamp_cursor(cursor_index)
@@ -202,6 +237,8 @@ class ChatInput(Static, can_focus=True):
             self._paste_chunks = {}
 
     def _insert_at_cursor(self, text: str) -> None:
+        """按字符索引把文本插入缓冲区，并刷新显示和终端光标。"""
+
         if not text:
             return
         self._text = (
@@ -212,6 +249,8 @@ class ChatInput(Static, can_focus=True):
         self._sync_terminal_cursor_position()
 
     def _delete_before_cursor(self) -> None:
+        """删除光标左侧一个 Python 字符。"""
+
         if self._cursor_index <= 0:
             return
         self._reset_history_navigation()
@@ -223,6 +262,8 @@ class ChatInput(Static, can_focus=True):
         self._sync_terminal_cursor_position()
 
     def _delete_after_cursor(self) -> None:
+        """删除光标右侧一个 Python 字符。"""
+
         if self._cursor_index >= len(self._text):
             return
         self._reset_history_navigation()
@@ -233,27 +274,41 @@ class ChatInput(Static, can_focus=True):
         self._sync_terminal_cursor_position()
 
     def _move_cursor(self, index: int) -> None:
+        """移动字符光标到指定索引，并同步屏幕上的硬件光标。"""
+
         self._cursor_index = self._clamp_cursor(index)
         self._refresh_display()
         self._sync_terminal_cursor_position()
 
     def _clamp_cursor(self, index: int) -> int:
+        """把目标字符索引限制在当前文本范围内。"""
+
         return min(max(index, 0), len(self._text))
 
     def _line_start_index(self, index: int) -> int:
+        """返回指定索引所在行的起始字符索引。"""
+
         return self._text.rfind("\n", 0, index) + 1
 
     def _line_end_index(self, index: int) -> int:
+        """返回指定索引所在行的结束字符索引。"""
+
         next_newline = self._text.find("\n", index)
         return len(self._text) if next_newline == -1 else next_newline
 
     def _cursor_is_on_first_line(self) -> bool:
+        """判断当前光标前方是否没有换行。"""
+
         return "\n" not in self._text[: self._cursor_index]
 
     def _cursor_is_on_last_line(self) -> bool:
+        """判断当前光标后方是否没有换行。"""
+
         return "\n" not in self._text[self._cursor_index :]
 
     def _history_previous(self) -> None:
+        """向更早的提交历史移动，并保留进入历史前的草稿。"""
+
         if not self._history:
             return
         if self._history_index is None:
@@ -266,6 +321,8 @@ class ChatInput(Static, can_focus=True):
         self._sync_terminal_cursor_position()
 
     def _history_next(self) -> None:
+        """向更新的提交历史移动，到末尾时恢复原草稿。"""
+
         if self._history_index is None:
             return
         if self._history_index < len(self._history) - 1:
@@ -279,10 +336,14 @@ class ChatInput(Static, can_focus=True):
         self._sync_terminal_cursor_position()
 
     def _reset_history_navigation(self) -> None:
+        """退出历史浏览状态，丢弃临时草稿指针。"""
+
         self._history_index = None
         self._history_draft = ""
 
     def _handle_paste(self, text: str) -> None:
+        """处理粘贴文本，大段粘贴折叠显示但提交时保留原文。"""
+
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         if not normalized:
             return
@@ -304,6 +365,8 @@ class ChatInput(Static, can_focus=True):
         self.insert(normalized)
 
     def _insert_printable(self, text: str) -> None:
+        """插入可打印字符，并兼容终端拆分发送的 CSI-u IME 序列。"""
+
         decoded = _decode_csi_u_text(text)
         if decoded is not None:
             self.insert(decoded)
@@ -331,16 +394,22 @@ class ChatInput(Static, can_focus=True):
             self.insert(character)
 
     def _flush_keyboard_sequence(self) -> None:
+        """提交前把尚未识别为 CSI-u 的缓存字符写回输入框。"""
+
         if self._keyboard_sequence:
             pending = self._keyboard_sequence
             self._keyboard_sequence = ""
             self.insert(pending)
 
     def _refresh_display(self) -> None:
+        """重新渲染输入框文本并同步真实终端光标位置。"""
+
         self.update(self._render_input())
         self._sync_terminal_cursor_position()
 
     def _render_input(self) -> Text:
+        """把内部文本缓冲渲染成带提示符的 Rich Text。"""
+
         rendered = Text()
         if not self._text:
             rendered.append("❯ ", style="bold cyan")
@@ -356,6 +425,8 @@ class ChatInput(Static, can_focus=True):
         return rendered
 
     def _sync_terminal_cursor_position(self) -> None:
+        """把 Textual 的硬件光标位置同步到当前字符光标所在终端 cell。"""
+
         if not self.has_focus or self.disabled:
             return
 
@@ -368,6 +439,8 @@ class ChatInput(Static, can_focus=True):
         )
 
     def _set_terminal_cursor_visible(self, visible: bool) -> None:
+        """通过底层 driver 显示或隐藏真实终端光标。"""
+
         driver = getattr(self.app, "_driver", None)
         if driver is None or getattr(driver, "is_headless", False):
             return
@@ -376,11 +449,15 @@ class ChatInput(Static, can_focus=True):
         driver.flush()
 
     def _cursor_line(self) -> tuple[int, str]:
+        """返回光标所在行号和该行光标左侧文本。"""
+
         lines = self._text[: self._cursor_index].split("\n")
         return len(lines) - 1, lines[-1]
 
 
 def _decode_csi_u_text(sequence: str) -> str | None:
+    """把 Kitty/CSI-u 编码的 Unicode 码点序列还原为文本。"""
+
     # Kitty/CSI-u 键盘协议可能把 IME 文本编码为 "[32;;20320:21834u"。
     if sequence.startswith("\x1b"):
         sequence = sequence[1:]
@@ -402,6 +479,8 @@ def _decode_csi_u_text(sequence: str) -> str | None:
 
 
 def _is_csi_u_prefix(sequence: str) -> bool:
+    """判断当前缓存是否仍可能是一个尚未完整到达的 CSI-u 序列。"""
+
     if len(sequence) > 128 or not sequence.startswith("["):
         return False
     return all(character.isdigit() or character in ";:" for character in sequence[1:])

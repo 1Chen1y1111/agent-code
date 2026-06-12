@@ -1,4 +1,5 @@
-"""内置提示词与启动横幅资源。
+"""
+内置提示词与启动横幅资源。
 
 集中放置 system prompt 和 ASCII banner，避免 UI、provider 适配器各自拼接固定文案。
 """
@@ -21,6 +22,8 @@ PET_BANNER = r"""
 
 
 def render_banner(version: str, cwd: str) -> Text:
+    """生成启动时展示的 ASCII banner 和当前工作目录信息。"""
+
     # 直接返回 Rich Text，避免开启 markup 后误解析用户内容里的方括号。
     banner = Text()
     banner.append(f"{PET_BANNER}\n\n", style="bold yellow")

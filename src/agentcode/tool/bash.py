@@ -1,4 +1,5 @@
-"""命令执行工具。
+"""
+命令执行工具。
 
 负责异步执行 shell 命令并返回 stdout/stderr/退出码；超时由注册中心统一控制。
 """
@@ -12,12 +13,18 @@ from agentcode.tool import Result, _load_json_object, _truncate
 
 class BashTool:
     def name(self) -> str:
+        """返回模型调用命令执行能力时使用的工具名。"""
+
         return "bash"
 
     def description(self) -> str:
+        """描述 shell 执行工具的能力和输出形态。"""
+
         return "在当前工作目录执行 shell 命令，返回 stdout、stderr 和退出码。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 bash 工具接受的 JSON 参数 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -27,6 +34,8 @@ class BashTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """执行 shell 命令，并把进程输出和退出码汇总给模型。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)

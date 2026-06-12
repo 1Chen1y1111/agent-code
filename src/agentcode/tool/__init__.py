@@ -1,4 +1,5 @@
-"""AgentCode 内置工具系统。
+"""
+AgentCode 内置工具系统。
 
 负责定义统一工具协议、执行结果、注册中心，以及默认六个文件/命令工具的装配。
 """
@@ -26,23 +27,35 @@ class Result:
 class Tool(Protocol):
     """模型可调用工具的统一协议。"""
 
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """返回模型调用时使用的工具名。"""
+        ...
 
-    def description(self) -> str: ...
+    def description(self) -> str:
+        """返回暴露给模型的工具用途说明。"""
+        ...
 
-    def parameters(self) -> dict[str, Any]: ...
+    def parameters(self) -> dict[str, Any]:
+        """返回 provider 可转发给模型的 JSON Schema 参数定义。"""
+        ...
 
-    async def execute(self, args: str) -> Result: ...
+    async def execute(self, args: str) -> Result:
+        """执行模型传入的 JSON 参数，并以结构化结果返回。"""
+        ...
 
 
 class Registry:
     """集中登记、导出和执行工具。"""
 
     def __init__(self) -> None:
+        """初始化按注册顺序保存工具的注册中心。"""
+
         self._order: list[str] = []
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
+        """注册一个工具，并拒绝重复的模型可见工具名。"""
+
         name = tool.name()
         if name in self._tools:
             raise ValueError(f"工具已注册: {name}")
@@ -50,9 +63,13 @@ class Registry:
         self._tools[name] = tool
 
     def get(self, name: str) -> Tool | None:
+        """按模型请求的工具名查找工具实例。"""
+
         return self._tools.get(name)
 
     def definitions(self) -> list[ToolDefinition]:
+        """把注册工具转换为 provider 层统一工具定义。"""
+
         return [
             ToolDefinition(
                 name=tool.name(),
@@ -65,6 +82,8 @@ class Registry:
     async def execute(
         self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT
     ) -> Result:
+        """执行指定工具，并把未知工具、超时和异常都转成 Result。"""
+
         tool = self.get(name)
         if tool is None:
             return Result(content=f"未知工具: {name}", is_error=True)
@@ -88,9 +107,9 @@ def new_default_registry() -> Registry:
 
     registry = Registry()
     registry.register(ReadFileTool())
-    registry.register(WriteFileTool())
-    registry.register(EditFileTool())
     registry.register(BashTool())
+    registry.register(EditFileTool())
+    registry.register(WriteFileTool())
     registry.register(GlobTool())
     registry.register(GrepTool())
     return registry

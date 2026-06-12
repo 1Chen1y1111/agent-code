@@ -1,4 +1,5 @@
-"""文本内容搜索工具。
+"""
+文本内容搜索工具。
 
 负责用 Python 正则搜索文件内容并返回文件、行号和命中行。
 """
@@ -17,12 +18,18 @@ MAX_LINE_CHARS = 1_000_000
 
 class GrepTool:
     def name(self) -> str:
+        """返回模型调用内容搜索能力时使用的工具名。"""
+
         return "grep"
 
     def description(self) -> str:
+        """描述 grep 工具返回 file:line:content 命中列表的行为。"""
+
         return "用 Python 正则搜索文件内容，返回 file:line:content 命中列表。"
 
     def parameters(self) -> dict[str, object]:
+        """声明 grep 工具的正则、根目录和文件过滤参数 schema。"""
+
         return {
             "type": "object",
             "properties": {
@@ -40,6 +47,8 @@ class GrepTool:
         }
 
     async def execute(self, args: str) -> Result:
+        """搜索匹配内容，跳过不可读文件并截断过大的命中集合。"""
+
         data, error = _load_json_object(args)
         if error is not None:
             return Result(error, is_error=True)
