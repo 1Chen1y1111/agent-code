@@ -5,12 +5,33 @@ import io
 import re
 import unittest
 from collections.abc import AsyncIterator
+from unittest.mock import patch
 
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.text import Text
 
 from agentcode.config import ProviderConfig
-from agentcode.llm import Message, StreamEvent, ToolCall
-from agentcode.tool import Registry, Result
+from agentcode.llm import (
+    AssistantContent,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    DoneEvent,
+    DoneStopReason,
+    ErrorEvent,
+    Message,
+    StartEvent,
+    TextContent,
+    TextDeltaEvent,
+    ThinkingContent,
+    ThinkingDeltaEvent,
+    ToolCall,
+    ToolCallEndEvent,
+    Usage,
+    message_text,
+)
+from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
 from agentcode.tui import AgentCodeApp, SessionState
 from agentcode.tui.input import ChatInput, _decode_csi_u_text
 from agentcode.tui.scrollbar import PillScrollBarRender
@@ -25,9 +46,18 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_provider_starts_idle(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
 
-        async with app.run_test():
+        async with app.run_test() as pilot:
+            await pilot.pause(0.1)
+
+            input_box = app.query_one("#input", ChatInput)
             self.assertEqual(app.state, SessionState.IDLE)
             self.assertEqual(app.provider.name, "Only")
+            self.assertTrue(input_box.has_focus)
+
+            await pilot.press("h", "i")
+            await pilot.pause(0.1)
+
+            self.assertEqual(input_box.text, "hi")
 
     async def test_multiple_providers_start_selecting(self) -> None:
         app = AgentCodeApp([_provider("One", "openai"), _provider("Two", "anthropic")])
@@ -130,7 +160,14 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_working_text_uses_spinner_and_message(self) -> None:
-        self.assertEqual(working_text("⠋").plain, "⠋ Working...")
+        self.assertEqual(working_text("⠋").plain, " \n⠋ Working...")
+
+    def test_final_elapsed_seconds_never_shows_zero(self) -> None:
+        app = AgentCodeApp([_provider("Only", "openai")])
+        app.turn_start = 100.0
+
+        with patch("agentcode.tui.app.time.monotonic", return_value=100.01):
+            self.assertEqual(app._final_elapsed_seconds(), 1)
 
     async def test_working_indicator_uses_chat_flow_not_fixed_row(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -156,7 +193,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.3)
 
             self.assertEqual(
-                [(message.role, message.content) for message in _messages(app)],
+                [(message.role, message_text(message)) for message in _messages(app)],
                 [("user", "hi"), ("assistant", "ok")],
             )
             self.assertEqual(input_box.text, "")
@@ -177,19 +214,16 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             app.provider = ScriptedProvider(
                 [
-                    [
-                        StreamEvent(
-                            tool_calls=[
-                                ToolCall(
-                                    id="call_1",
-                                    name="read",
-                                    input='{"path":"note.txt"}',
-                                )
-                            ]
-                        ),
-                        StreamEvent(done=True),
-                    ],
-                    [StreamEvent(text="done"), StreamEvent(done=True)],
+                    _assistant_events(
+                        tool_calls=[
+                            ToolCall(
+                                id="call_1",
+                                name="read",
+                                arguments={"path": "note.txt"},
+                            )
+                        ]
+                    ),
+                    _assistant_events(text="done"),
                 ]
             )
             input_box = app.query_one("#input", ChatInput)
@@ -204,17 +238,33 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("file content", chat_text)
             self.assertIn("done", chat_text)
 
+    async def test_plan_command_is_sent_as_plain_user_text(self) -> None:
+        registry = Registry()
+        registry.register(FakeTool("read", "file content", "parallel"))
+        registry.register(FakeTool("bash", "ran", "sequential"))
+        provider = ScriptedProvider([_assistant_events(text="计划")])
+        app = AgentCodeApp([_provider("Only", "openai")], registry=registry)
+
+        async with app.run_test() as pilot:
+            app.provider = provider
+
+            await app.submit("/plan inspect")
+            await pilot.pause(0.3)
+
+            self.assertEqual(provider.requests[0].messages[0].content, "/plan inspect")
+            self.assertEqual(
+                [definition.name for definition in provider.requests[0].tools or []],
+                ["read", "bash"],
+            )
+            self.assertEqual(message_text(_messages(app)[0]), "/plan inspect")
+
     async def test_thinking_stream_renders_before_visible_answer(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
 
         async with app.run_test() as pilot:
             app.provider = ScriptedProvider(
                 [
-                    [
-                        StreamEvent(thinking="先分析边界"),
-                        StreamEvent(text="最终答案"),
-                        StreamEvent(done=True),
-                    ]
+                    _assistant_events(thinking="先分析边界", text="最终答案")
                 ]
             )
             input_box = app.query_one("#input", ChatInput)
@@ -226,7 +276,39 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             chat_text = _chat_text(app)
             self.assertIn("先分析边界", chat_text)
             self.assertIn("最终答案", chat_text)
-            self.assertEqual(_messages(app)[-1].content, "最终答案")
+            self.assertEqual(message_text(_messages(app)[-1]), "最终答案")
+
+    async def test_streaming_reply_becomes_markdown_after_done(self) -> None:
+        app = AgentCodeApp([_provider("Only", "openai")])
+
+        async with app.run_test() as pilot:
+            provider = ControlledTextProvider("**最终答案**")
+            app.provider = provider
+            input_box = app.query_one("#input", ChatInput)
+            input_box.focus()
+
+            await pilot.press("h", "i", "enter")
+            for _ in range(20):
+                if _assistant_widgets(app):
+                    break
+                await pilot.pause(0.05)
+            else:
+                self.fail("assistant stream did not render")
+
+            streaming_renderable = _assistant_widgets(app)[0].renderable
+            self.assertIsInstance(streaming_renderable, Text)
+            self.assertFalse(_contains_renderable(streaming_renderable, Markdown))
+
+            provider.resume()
+            for _ in range(20):
+                if app.state is SessionState.IDLE:
+                    break
+                await pilot.pause(0.05)
+            else:
+                self.fail("assistant stream did not finish")
+
+            final_renderable = _assistant_widgets(app)[0].renderable
+            self.assertTrue(_contains_renderable(final_renderable, Markdown))
 
     async def test_ctrl_t_hides_streaming_thinking_block(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -268,32 +350,72 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         app = AgentCodeApp([_provider("Only", "openai")])
 
         async with app.run_test() as pilot:
-            app.provider = SlowThinkingProvider("先分析边界", "最终答案")
+            provider = ControlledThinkingProvider("先分析边界", "最终答案")
+            app.provider = provider
             input_box = app.query_one("#input", ChatInput)
             input_box.focus()
 
             await pilot.press("h", "i", "enter")
-            await pilot.pause(0.03)
+            first_frame = ""
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if _working_widgets(app):
+                    first_frame = _working_text(app)
+                    break
+            else:
+                self.fail("working indicator did not render")
 
-            first_frame = _working_text(app)
-            self.assertEqual(len(_working_widgets(app)), 1)
             self.assertIn("Working...", first_frame)
             self.assertIn("Working...", _chat_text(app))
 
-            await pilot.pause(0.13)
+            for _ in range(20):
+                await pilot.pause(0.02)
+                if _working_text(app) != first_frame:
+                    break
+            else:
+                self.fail("working indicator did not animate")
 
             self.assertNotEqual(_working_text(app), first_frame)
 
-            await pilot.pause(0.3)
+            provider.resume()
+            for _ in range(20):
+                await pilot.pause(0.02)
+                if not _working_widgets(app) and "最终答案" in _chat_text(app):
+                    break
+            else:
+                self.fail("working indicator did not hide")
 
             self.assertEqual(_working_widgets(app), [])
             self.assertNotIn("Working...", _chat_text(app))
+
+    async def test_finish_scrolls_to_bottom_after_working_hides(self) -> None:
+        text = "\n".join(f"line {index}" for index in range(40))
+        app = AgentCodeApp([_provider("Only", "openai")])
+
+        async with app.run_test(size=(80, 12)) as pilot:
+            app.provider = ScriptedProvider([_assistant_events(text=text)])
+
+            await app.submit("hi")
+            chat = app.query_one("#chat", VerticalScroll)
+            for _ in range(40):
+                await pilot.pause(0.05)
+                if app.state is SessionState.IDLE and not _working_widgets(app):
+                    break
+            else:
+                self.fail("turn did not finish")
+
+            self.assertIn("line 39", _chat_text(app))
+            self.assertIn("耗时：", _chat_text(app))
+            self.assertTrue(
+                chat.is_vertical_scroll_end,
+                f"chat stopped before bottom: scroll_y={chat.scroll_y}, max={chat.max_scroll_y}",
+            )
 
     async def test_working_indicator_hides_after_stream_error(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
 
         async with app.run_test() as pilot:
-            app.provider = ScriptedProvider([[StreamEvent(err=RuntimeError("boom"))]])
+            app.provider = ScriptedProvider([_error_events(RuntimeError("boom"))])
             input_box = app.query_one("#input", ChatInput)
             input_box.focus()
 
@@ -313,19 +435,16 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             app.provider = ScriptedProvider(
                 [
-                    [
-                        StreamEvent(
-                            tool_calls=[
-                                ToolCall(
-                                    id="call_1",
-                                    name="read",
-                                    input='{"path":"note.txt"}',
-                                )
-                            ]
-                        ),
-                        StreamEvent(done=True),
-                    ],
-                    [StreamEvent(text="done"), StreamEvent(done=True)],
+                    _assistant_events(
+                        tool_calls=[
+                            ToolCall(
+                                id="call_1",
+                                name="read",
+                                arguments={"path": "note.txt"},
+                            )
+                        ]
+                    ),
+                    _assistant_events(text="done"),
                 ]
             )
             input_box = app.query_one("#input", ChatInput)
@@ -726,35 +845,137 @@ def _provider(name: str, protocol: str) -> ProviderConfig:
     )
 
 
+def _assistant_message(
+    text: str = "",
+    thinking: str = "",
+    tool_calls: list[ToolCall] | None = None,
+) -> AssistantMessage:
+    content: list[AssistantContent] = []
+    if thinking:
+        content.append(ThinkingContent(thinking=thinking))
+    if text:
+        content.append(TextContent(text=text))
+    content.extend(tool_calls or [])
+    return AssistantMessage(
+        content=content,
+        api="fake",
+        provider="Fake",
+        model="fake-model",
+        usage=Usage(),
+        stop_reason="toolUse" if tool_calls else "stop",
+    )
+
+
+def _assistant_events(
+    text: str = "",
+    thinking: str = "",
+    tool_calls: list[ToolCall] | None = None,
+) -> list[AssistantMessageEvent]:
+    events: list[AssistantMessageEvent] = [StartEvent(partial=AssistantMessage())]
+    if thinking:
+        events.append(
+            ThinkingDeltaEvent(
+                content_index=0,
+                delta=thinking,
+                partial=AssistantMessage(content=[ThinkingContent(thinking=thinking)]),
+            )
+        )
+    if text:
+        content_index = 1 if thinking else 0
+        events.append(
+            TextDeltaEvent(
+                content_index=content_index,
+                delta=text,
+                partial=_assistant_message(text, thinking),
+            )
+        )
+    message = _assistant_message(text, thinking, tool_calls)
+    tool_start = len(message.content) - len(tool_calls or [])
+    for index, call in enumerate(tool_calls or [], start=tool_start):
+        events.append(
+            ToolCallEndEvent(
+                content_index=index,
+                tool_call=call,
+                partial=message,
+            )
+        )
+    events.append(
+        DoneEvent(reason=_done_reason(message.stop_reason), message=message)
+    )
+    return events
+
+
+def _done_reason(reason: str) -> DoneStopReason:
+    if reason in ("stop", "length", "toolUse"):
+        return reason
+    return "stop"
+
+
+def _error_events(exc: Exception) -> list[AssistantMessageEvent]:
+    return [
+        ErrorEvent(
+            reason="error",
+            error=AssistantMessage(stop_reason="error", error_message=str(exc)),
+            err=exc,
+        )
+    ]
+
+
 class FakeProvider:
     def __init__(self, reply: str) -> None:
+        self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
         self._reply = reply
 
     async def stream(
-        self, msgs: list[Message], tools: list[object] | None = None
-    ) -> AsyncIterator[StreamEvent]:
-        yield StreamEvent(text=self._reply)
-        yield StreamEvent(done=True)
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        for event in _assistant_events(text=self._reply):
+            yield event
 
 
 class ScriptedProvider:
-    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+    def __init__(self, scripts: list[list[AssistantMessageEvent]]) -> None:
+        self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
         self._scripts = scripts
+        self.requests: list[Context] = []
 
     async def stream(
-        self, msgs: list[Message], tools: list[object] | None = None
-    ) -> AsyncIterator[StreamEvent]:
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        self.requests.append(context)
         script = self._scripts.pop(0)
         for event in script:
             yield event
 
 
+class ControlledTextProvider:
+    def __init__(self, reply: str) -> None:
+        self.api = "fake"
+        self.name = "Fake"
+        self.model = "fake-model"
+        self._reply = reply
+        self._resume = asyncio.Event()
+
+    def resume(self) -> None:
+        self._resume.set()
+
+    async def stream(
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        message = _assistant_message(self._reply)
+        yield StartEvent(partial=AssistantMessage())
+        yield TextDeltaEvent(content_index=0, delta=self._reply, partial=message)
+        await self._resume.wait()
+        yield DoneEvent(reason="stop", message=message)
+
+
 class SlowThinkingProvider:
     def __init__(self, thinking: str, reply: str, delay: float = 0.2) -> None:
+        self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
         self._thinking = thinking
@@ -762,16 +983,31 @@ class SlowThinkingProvider:
         self._delay = delay
 
     async def stream(
-        self, msgs: list[Message], tools: list[object] | None = None
-    ) -> AsyncIterator[StreamEvent]:
-        yield StreamEvent(thinking=self._thinking)
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        yield StartEvent(partial=AssistantMessage())
+        yield ThinkingDeltaEvent(
+            content_index=0,
+            delta=self._thinking,
+            partial=AssistantMessage(
+                content=[ThinkingContent(thinking=self._thinking)]
+            ),
+        )
         await asyncio.sleep(self._delay)
-        yield StreamEvent(text=self._reply)
-        yield StreamEvent(done=True)
+        yield TextDeltaEvent(
+            content_index=1,
+            delta=self._reply,
+            partial=_assistant_message(self._reply, self._thinking),
+        )
+        yield DoneEvent(
+            reason="stop",
+            message=_assistant_message(self._reply, self._thinking),
+        )
 
 
 class ControlledThinkingProvider:
     def __init__(self, thinking: str, reply: str) -> None:
+        self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
         self._thinking = thinking
@@ -782,18 +1018,35 @@ class ControlledThinkingProvider:
         self._resume.set()
 
     async def stream(
-        self, msgs: list[Message], tools: list[object] | None = None
-    ) -> AsyncIterator[StreamEvent]:
-        yield StreamEvent(thinking=self._thinking)
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        yield StartEvent(partial=AssistantMessage())
+        yield ThinkingDeltaEvent(
+            content_index=0,
+            delta=self._thinking,
+            partial=AssistantMessage(
+                content=[ThinkingContent(thinking=self._thinking)]
+            ),
+        )
         await self._resume.wait()
-        yield StreamEvent(text=self._reply)
-        yield StreamEvent(done=True)
+        yield TextDeltaEvent(
+            content_index=1,
+            delta=self._reply,
+            partial=_assistant_message(self._reply, self._thinking),
+        )
+        yield DoneEvent(
+            reason="stop",
+            message=_assistant_message(self._reply, self._thinking),
+        )
 
 
-class FakeTool:
-    def __init__(self, name: str, content: str) -> None:
+class FakeTool(BaseTool):
+    def __init__(
+        self, name: str, content: str, mode: ExecutionMode = "parallel"
+    ) -> None:
         self._name = name
         self._content = content
+        self._mode = mode
 
     def name(self) -> str:
         return self._name
@@ -804,8 +1057,16 @@ class FakeTool:
     def parameters(self) -> dict[str, object]:
         return {"type": "object", "properties": {}}
 
-    async def execute(self, args: str) -> Result:
-        return Result(self._content)
+    def execution_mode(self) -> ExecutionMode:
+        return self._mode
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, object],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
+        return text_result(self._content)
 
 
 class BlockingTool(FakeTool):
@@ -816,9 +1077,14 @@ class BlockingTool(FakeTool):
     def resume(self) -> None:
         self._resume.set()
 
-    async def execute(self, args: str) -> Result:
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, object],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         await self._resume.wait()
-        return Result(self._content)
+        return text_result(self._content)
 
 
 class CursorDriver:
@@ -847,6 +1113,14 @@ def _messages(app: AgentCodeApp) -> list[Message]:
     return app.agent_session.messages()
 
 
+def _assistant_widgets(app: AgentCodeApp) -> list[Static]:
+    return [
+        widget
+        for widget in app.query_one("#chat", VerticalScroll).query(Static)
+        if "assistant-message" in widget.classes
+    ]
+
+
 def _working_widgets(app: AgentCodeApp) -> list[Static]:
     return [
         widget
@@ -866,6 +1140,15 @@ def _static_text(widget: Static) -> str:
     console = Console(width=120, record=True, file=io.StringIO())
     console.print(widget.render())
     return console.export_text()
+
+
+def _contains_renderable(renderable: object, renderable_type: type[object]) -> bool:
+    if isinstance(renderable, renderable_type):
+        return True
+    return any(
+        _contains_renderable(child, renderable_type)
+        for child in getattr(renderable, "renderables", ())
+    )
 
 
 if __name__ == "__main__":

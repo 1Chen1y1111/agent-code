@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from agentcode.tool import Result, _load_json_object
+from agentcode.tool import BaseTool, ExecutionMode, ToolResult, ToolUpdate, text_result
 
 
-class WriteFileTool:
+class WriteFileTool(BaseTool):
     def name(self) -> str:
         """返回模型调用文件写入能力时使用的工具名。"""
 
@@ -34,23 +35,26 @@ class WriteFileTool:
             "required": ["path", "content"],
         }
 
-    async def execute(self, args: str) -> Result:
+    def execution_mode(self) -> ExecutionMode:
+        """write 会创建或覆盖文件，必须串行执行以保持结果可预测。"""
+
+        return "sequential"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         """创建父目录后写入完整内容，并把写入失败转为工具错误。"""
 
-        data, error = _load_json_object(args)
-        if error is not None:
-            return Result(error, is_error=True)
-        path_value = data.get("path") if data is not None else None
-        content = data.get("content") if data is not None else None
-        if not isinstance(path_value, str) or not path_value:
-            return Result("缺少必填参数: path", is_error=True)
-        if not isinstance(content, str):
-            return Result("缺少必填参数: content", is_error=True)
+        path_value = args["path"]
+        content = args["content"]
 
         path = Path(path_value)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         except OSError as exc:
-            return Result(f"写入失败: {exc}", is_error=True)
-        return Result(f"已写入 {path}（{len(content.encode('utf-8'))} 字节）")
+            return text_result(f"写入失败: {exc}", is_error=True)
+        return text_result(f"已写入 {path}（{len(content.encode('utf-8'))} 字节）")

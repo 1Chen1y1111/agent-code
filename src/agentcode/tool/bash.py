@@ -7,11 +7,19 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
-from agentcode.tool import Result, _load_json_object, _truncate
+from agentcode.tool import (
+    BaseTool,
+    ExecutionMode,
+    ToolResult,
+    ToolUpdate,
+    _truncate,
+    text_result,
+)
 
 
-class BashTool:
+class BashTool(BaseTool):
     def name(self) -> str:
         """返回模型调用命令执行能力时使用的工具名。"""
 
@@ -33,15 +41,20 @@ class BashTool:
             "required": ["command"],
         }
 
-    async def execute(self, args: str) -> Result:
+    def execution_mode(self) -> ExecutionMode:
+        """bash 可能产生副作用，必须在同一批工具调用中串行执行。"""
+
+        return "sequential"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         """执行 shell 命令，并把进程输出和退出码汇总给模型。"""
 
-        data, error = _load_json_object(args)
-        if error is not None:
-            return Result(error, is_error=True)
-        command = data.get("command") if data is not None else None
-        if not isinstance(command, str) or not command:
-            return Result("缺少必填参数: command", is_error=True)
+        command = args["command"]
 
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -59,4 +72,4 @@ class BashTool:
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
         content = f"exit_code: {proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        return Result(_truncate(content, max_lines=10000, max_chars=30000))
+        return text_result(_truncate(content, max_lines=10000, max_chars=30000))

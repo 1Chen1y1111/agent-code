@@ -1,115 +1,276 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
-from agentcode.agent import Agent, SINGLE_TOOL_ROUND_LIMIT_MESSAGE
+from agentcode.agent import (
+    MAX_ITERATIONS_MESSAGE,
+    UNKNOWN_TOOL_LIMIT_MESSAGE,
+    Agent,
+    AgentRunOptions,
+)
 from agentcode.conversation import Conversation
-from agentcode.llm import Message, StreamEvent, ToolCall, ToolDefinition
+from agentcode.llm import (
+    AssistantContent,
+    AssistantMessage,
+    AssistantMessageEvent,
+    Context,
+    DoneEvent,
+    DoneStopReason,
+    StartEvent,
+    TextContent,
+    TextDeltaEvent,
+    ThinkingContent,
+    ThinkingDeltaEvent,
+    ToolCall,
+    Usage,
+    message_text,
+)
 from agentcode.session import AgentSession
-from agentcode.tool import Registry, Result
+from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
 
 
 @pytest.mark.asyncio
-async def test_agent_runs_single_tool_round_and_final_answer() -> None:
+async def test_agent_loops_until_model_stops_requesting_tools() -> None:
     conv = Conversation()
-    conv.add_user("read it")
+    conv.add_user("read and grep")
     provider = FakeProvider(
         [
             [
-                StreamEvent(
+                *_assistant_events(
                     tool_calls=[
                         ToolCall(
                             id="call_1",
                             name="read",
-                            input='{"path":"note.txt"}',
+                            arguments={"path": "note.txt"},
                         )
                     ]
                 ),
-                StreamEvent(done=True),
             ],
-            [StreamEvent(text="文件已读取"), StreamEvent(done=True)],
+            [
+                *_assistant_events(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_2",
+                            name="grep",
+                            arguments={"pattern": "todo"},
+                        )
+                    ]
+                ),
+            ],
+            _assistant_events(text="最终答案"),
         ]
     )
     registry = RecordingRegistry()
-    registry.register(FakeTool("read", "content"))
+    registry.register(FakeTool("read", "file content", "parallel"))
+    registry.register(FakeTool("grep", "grep content", "parallel"))
 
     events = [event async for event in Agent(provider, registry).run(conv)]
 
-    assert [event.type for event in events] == [
-        "message_start",
-        "message_end",
-        "tool_execution_start",
-        "tool_execution_end",
-        "message_start",
-        "message_end",
-        "message_start",
-        "message_update",
-        "message_end",
-        "turn_end",
-        "agent_end",
+    assert [event.text for event in events if event.text] == ["最终答案"]
+    assert registry.calls == [
+        ("read", {"path": "note.txt"}),
+        ("grep", {"pattern": "todo"}),
     ]
-    assert [event.tool_name for event in events if event.type.startswith("tool_")] == [
-        "read",
-        "read",
-    ]
-    assert [event.text for event in events if event.text] == ["文件已读取"]
+    assert len(provider.requests) == 3
     assert [message.role for message in conv.messages()] == [
         "user",
         "assistant",
-        "tool",
+        "toolResult",
+        "assistant",
+        "toolResult",
         "assistant",
     ]
-    assert conv.messages()[-1] == Message(role="assistant", content="文件已读取")
-    assert registry.calls == [("read", '{"path":"note.txt"}')]
-    assert len(provider.requests) == 2
-    assert provider.requests[0][1][0].name == "read"
+    tool_messages = [
+        message for message in conv.messages() if message.role == "toolResult"
+    ]
+    assert [message.tool_name for message in tool_messages] == ["read", "grep"]
+    assistant_messages = [
+        message for message in conv.messages() if message.role == "assistant"
+    ]
+    assert [message.stop_reason for message in assistant_messages] == [
+        "toolUse",
+        "toolUse",
+        "stop",
+    ]
+    assert message_text(conv.messages()[-1]) == "最终答案"
+    assert events[-1].type == "agent_end"
+    assert events[-1].stop_reason == "completed"
 
 
 @pytest.mark.asyncio
-async def test_agent_does_not_execute_second_round_tool_calls() -> None:
+async def test_agent_stops_at_iteration_limit_after_tool_result() -> None:
     conv = Conversation()
-    conv.add_user("read twice")
+    conv.add_user("loop")
     provider = FakeProvider(
         [
             [
-                StreamEvent(
-                    tool_calls=[ToolCall(id="call_1", name="read", input="{}")]
+                *_assistant_events(
+                    tool_calls=[ToolCall(id="call_1", name="read")]
                 ),
-                StreamEvent(done=True),
+            ]
+        ]
+    )
+    registry = RecordingRegistry()
+    registry.register(FakeTool("read", "content", "parallel"))
+
+    events = [
+        event
+        async for event in Agent(provider, registry).run(
+            conv, AgentRunOptions(max_iterations=1)
+        )
+    ]
+
+    assert registry.calls == [("read", {})]
+    assert len(provider.requests) == 1
+    assert [event.text for event in events if event.text] == [MAX_ITERATIONS_MESSAGE]
+    assert message_text(conv.messages()[-1]) == MAX_ITERATIONS_MESSAGE
+    assert events[-1].stop_reason == "max_iterations"
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_after_repeated_unknown_tools() -> None:
+    conv = Conversation()
+    conv.add_user("call missing")
+    provider = FakeProvider(
+        [
+            [
+                *_assistant_events(
+                    tool_calls=[ToolCall(id="call_1", name="missing")]
+                ),
             ],
             [
-                StreamEvent(
-                    tool_calls=[ToolCall(id="call_2", name="read", input="{}")]
+                *_assistant_events(
+                    tool_calls=[ToolCall(id="call_2", name="missing")]
                 ),
-                StreamEvent(done=True),
             ],
         ]
     )
     registry = RecordingRegistry()
-    registry.register(FakeTool("read", "content"))
 
-    events = [event async for event in Agent(provider, registry).run(conv)]
-
-    assert registry.calls == [("read", "{}")]
-    assert [event.text for event in events if event.text] == [
-        SINGLE_TOOL_ROUND_LIMIT_MESSAGE
+    events = [
+        event
+        async for event in Agent(provider, registry).run(
+            conv, AgentRunOptions(max_unknown_tools=2)
+        )
     ]
-    assert conv.messages()[-1].content == SINGLE_TOOL_ROUND_LIMIT_MESSAGE
+
+    tool_errors = [
+        event.result for event in events if event.type == "tool_execution_end"
+    ]
+    assert tool_errors == [
+        "未知工具: missing",
+        "未知工具: missing",
+    ]
+    assert registry.calls == []
+    assert len(provider.requests) == 2
+    assert [event.text for event in events if event.text] == [
+        UNKNOWN_TOOL_LIMIT_MESSAGE
+    ]
+    assert events[-1].stop_reason == "unknown_tool_limit"
 
 
 @pytest.mark.asyncio
-async def test_agent_streams_thinking_without_storing_it_in_history() -> None:
+async def test_agent_runs_parallel_tools_concurrently() -> None:
     conv = Conversation()
-    conv.add_user("explain")
+    conv.add_user("parallel")
     provider = FakeProvider(
         [
             [
-                StreamEvent(thinking="先分析"),
-                StreamEvent(text="答案"),
-                StreamEvent(done=True),
+                *_assistant_events(
+                    tool_calls=[
+                        ToolCall(id="call_1", name="read"),
+                        ToolCall(id="call_2", name="grep"),
+                    ]
+                ),
+            ],
+            _assistant_events(text="done"),
+        ]
+    )
+    probe = ConcurrencyProbe()
+    registry = RecordingRegistry()
+    registry.register(ProbeTool("read", "parallel", probe))
+    registry.register(ProbeTool("grep", "parallel", probe))
+
+    await _collect(Agent(provider, registry).run(conv))
+
+    assert probe.max_active == 2
+    assert registry.calls == [("read", {}), ("grep", {})]
+
+
+@pytest.mark.asyncio
+async def test_agent_runs_side_effect_tools_sequentially() -> None:
+    conv = Conversation()
+    conv.add_user("sequential")
+    provider = FakeProvider(
+        [
+            [
+                *_assistant_events(
+                    tool_calls=[
+                        ToolCall(id="call_1", name="write", arguments={"path": "a"}),
+                        ToolCall(
+                            id="call_2",
+                            name="bash",
+                            arguments={"command": "x"},
+                        ),
+                    ]
+                ),
+            ],
+            _assistant_events(text="done"),
+        ]
+    )
+    probe = ConcurrencyProbe()
+    registry = RecordingRegistry()
+    registry.register(ProbeTool("write", "sequential", probe))
+    registry.register(ProbeTool("bash", "sequential", probe))
+
+    await _collect(Agent(provider, registry).run(conv))
+
+    assert probe.max_active == 1
+    assert probe.order == ["write", "bash"]
+    assert registry.calls == [
+        ("write", {"path": "a"}),
+        ("bash", {"command": "x"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_forwards_tool_updates_and_terminates_when_requested() -> None:
+    conv = Conversation()
+    conv.add_user("update")
+    provider = FakeProvider(
+        [
+            [
+                *_assistant_events(
+                    tool_calls=[ToolCall(id="call_1", name="stop")]
+                ),
             ]
+        ]
+    )
+    registry = RecordingRegistry()
+    registry.register(UpdatingTerminatingTool())
+
+    events = [event async for event in Agent(provider, registry).run(conv)]
+
+    assert [event.result for event in events if event.type == "tool_execution_update"] == [
+        "partial"
+    ]
+    assert events[-1].type == "agent_end"
+    assert events[-1].stop_reason == "tool_terminated"
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_streams_usage_and_thinking_without_storing_thinking() -> None:
+    conv = Conversation()
+    conv.add_user("explain")
+    usage = Usage(input=3, output=5, total_tokens=8)
+    provider = FakeProvider(
+        [
+            _assistant_events(thinking="先分析", text="答案", usage=usage)
         ]
     )
     registry = RecordingRegistry()
@@ -118,49 +279,63 @@ async def test_agent_streams_thinking_without_storing_it_in_history() -> None:
 
     assert [event.thinking for event in events if event.thinking] == ["先分析"]
     assert [event.text for event in events if event.text] == ["答案"]
-    assert conv.messages()[-1] == Message(role="assistant", content="答案")
+    assert [event.usage for event in events if event.usage is not None] == [usage]
+    assert message_text(conv.messages()[-1]) == "答案"
+    assert conv.messages()[-1].usage == usage
+    assert conv.messages()[-1].stop_reason == "stop"
 
 
 @pytest.mark.asyncio
 async def test_agent_session_emits_user_events_and_keeps_history() -> None:
-    provider = FakeProvider([[StreamEvent(text="你好"), StreamEvent(done=True)]])
+    provider = FakeProvider([_assistant_events(text="你好")])
     session = AgentSession(provider, RecordingRegistry())
 
     events = [event async for event in session.prompt("hi")]
 
     assert [event.type for event in events[:4]] == [
         "agent_start",
-        "turn_start",
         "message_start",
         "message_end",
+        "turn_start",
     ]
-    assert events[3].message == Message(role="user", content="hi")
-    assert session.messages() == [
-        Message(role="user", content="hi"),
-        Message(role="assistant", content="你好"),
+    assert events[2].message is not None
+    assert events[2].message.role == "user"
+    assert message_text(events[2].message) == "hi"
+    assert [(message.role, message_text(message)) for message in session.messages()] == [
+        ("user", "hi"),
+        ("assistant", "你好"),
     ]
+
+
+async def _collect(stream: AsyncIterator[object]) -> list[object]:
+    events: list[object] = []
+    async for event in stream:
+        events.append(event)
+    return events
 
 
 class FakeProvider:
-    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+    def __init__(self, scripts: list[list[AssistantMessageEvent]]) -> None:
+        self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
         self._scripts = scripts
-        self.requests: list[tuple[list[Message], list[ToolDefinition]]] = []
+        self.requests: list[Context] = []
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition] | None = None
-    ) -> AsyncIterator[StreamEvent]:
-        self.requests.append((msgs, tools or []))
+        self, context: Context
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        self.requests.append(context)
         script = self._scripts.pop(0)
         for event in script:
             yield event
 
 
-class FakeTool:
-    def __init__(self, name: str, content: str) -> None:
+class FakeTool(BaseTool):
+    def __init__(self, name: str, content: str, mode: ExecutionMode) -> None:
         self._name = name
         self._content = content
+        self._mode = mode
 
     def name(self) -> str:
         return self._name
@@ -171,15 +346,124 @@ class FakeTool:
     def parameters(self) -> dict[str, object]:
         return {"type": "object", "properties": {}}
 
-    async def execute(self, args: str) -> Result:
-        return Result(self._content)
+    def execution_mode(self) -> ExecutionMode:
+        return self._mode
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
+        return text_result(self._content)
+
+
+class ConcurrencyProbe:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.order: list[str] = []
+
+    async def run(self, name: str) -> ToolResult:
+        self.order.append(name)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.02)
+        self.active -= 1
+        return text_result(f"{name} done")
+
+
+class ProbeTool(FakeTool):
+    def __init__(
+        self, name: str, mode: ExecutionMode, probe: ConcurrencyProbe
+    ) -> None:
+        super().__init__(name, f"{name} done", mode)
+        self._probe = probe
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
+        return await self._probe.run(self.name())
+
+
+class UpdatingTerminatingTool(FakeTool):
+    def __init__(self) -> None:
+        super().__init__("stop", "done", "sequential")
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
+        if on_update is not None:
+            on_update(text_result("partial"))
+        return text_result("done", terminate=True)
 
 
 class RecordingRegistry(Registry):
     def __init__(self) -> None:
         super().__init__()
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def execute(self, name: str, args: str, timeout: float = 30.0) -> Result:
+    async def execute(
+        self,
+        tool_call_id: str,
+        name: str,
+        args: dict[str, Any],
+        timeout: float = 30.0,
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         self.calls.append((name, args))
-        return await super().execute(name, args, timeout=timeout)
+        return await super().execute(
+            tool_call_id,
+            name,
+            args,
+            timeout=timeout,
+            on_update=on_update,
+        )
+
+
+def _assistant_events(
+    text: str = "",
+    thinking: str = "",
+    tool_calls: list[ToolCall] | None = None,
+    usage: Usage | None = None,
+) -> list[AssistantMessageEvent]:
+    """创建测试用统一 assistant 事件流。"""
+
+    content: list[AssistantContent] = []
+    events: list[AssistantMessageEvent] = [StartEvent(partial=AssistantMessage())]
+    if thinking:
+        content.append(ThinkingContent(thinking=thinking))
+        events.append(
+            ThinkingDeltaEvent(
+                content_index=len(content) - 1,
+                delta=thinking,
+                partial=AssistantMessage(content=list(content)),
+            )
+        )
+    if text:
+        content.append(TextContent(text=text))
+        events.append(
+            TextDeltaEvent(
+                content_index=len(content) - 1,
+                delta=text,
+                partial=AssistantMessage(content=list(content)),
+            )
+        )
+    content.extend(tool_calls or [])
+    reason: DoneStopReason = "toolUse" if tool_calls else "stop"
+    message = AssistantMessage(
+        content=content,
+        api="fake",
+        provider="Fake",
+        model="fake-model",
+        usage=usage or Usage(),
+        stop_reason=reason,
+    )
+    events.append(DoneEvent(reason=reason, message=message))
+    return events

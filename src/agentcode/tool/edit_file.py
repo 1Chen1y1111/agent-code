@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from agentcode.tool import Result, _load_json_object
+from agentcode.tool import BaseTool, ExecutionMode, ToolResult, ToolUpdate, text_result
 
 
-class EditFileTool:
+class EditFileTool(BaseTool):
     def name(self) -> str:
         """返回模型调用精确文本替换能力时使用的工具名。"""
 
@@ -38,33 +39,36 @@ class EditFileTool:
             "required": ["path", "old_string", "new_string"],
         }
 
-    async def execute(self, args: str) -> Result:
+    def execution_mode(self) -> ExecutionMode:
+        """edit 会修改文件，必须串行执行以避免写入顺序不确定。"""
+
+        return "sequential"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         """按唯一匹配规则修改文件，不唯一或缺失时返回可重试错误。"""
 
-        data, error = _load_json_object(args)
-        if error is not None:
-            return Result(error, is_error=True)
-        path_value = data.get("path") if data is not None else None
-        old = data.get("old_string") if data is not None else None
-        new = data.get("new_string") if data is not None else None
-        if not isinstance(path_value, str) or not path_value:
-            return Result("缺少必填参数: path", is_error=True)
-        if not isinstance(old, str) or old == "":
-            return Result("缺少必填参数: old_string", is_error=True)
-        if not isinstance(new, str):
-            return Result("缺少必填参数: new_string", is_error=True)
+        path_value = args["path"]
+        old = args["old_string"]
+        new = args["new_string"]
+        if old == "":
+            return text_result("缺少必填参数: old_string", is_error=True)
 
         path = Path(path_value)
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            return Result(f"读取失败: {exc}", is_error=True)
+            return text_result(f"读取失败: {exc}", is_error=True)
 
         count = content.count(old)
         if count == 0:
-            return Result("未找到匹配的内容", is_error=True)
+            return text_result("未找到匹配的内容", is_error=True)
         if count > 1:
-            return Result(
+            return text_result(
                 f"匹配到 {count} 处，old_string 不唯一，请提供更长上下文使其唯一",
                 is_error=True,
             )
@@ -72,5 +76,5 @@ class EditFileTool:
         try:
             path.write_text(content.replace(old, new, 1), encoding="utf-8")
         except OSError as exc:
-            return Result(f"写入失败: {exc}", is_error=True)
-        return Result(f"已修改 {path}")
+            return text_result(f"写入失败: {exc}", is_error=True)
+        return text_result(f"已修改 {path}")

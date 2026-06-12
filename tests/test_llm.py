@@ -6,20 +6,56 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agentcode.config import ProviderConfig
-from agentcode.llm import Message, ToolCall, ToolDefinition, ToolResult, new_provider
+from agentcode.llm import (
+    AssistantMessage,
+    Context,
+    StreamOptions,
+    TextContent,
+    ToolCall,
+    ToolDefinition,
+    ToolResultMessage,
+    UserMessage,
+    assistant_tool_calls,
+    create_provider,
+)
 from agentcode.llm.anthropic_provider import AnthropicProvider
 from agentcode.llm.openai_provider import OpenAIProvider
 from agentcode.prompt import SYSTEM_PROMPT
 
 
 class ProviderFactoryTests(unittest.TestCase):
-    def test_new_provider_anthropic(self) -> None:
-        provider = new_provider(_cfg("anthropic"))
+    def test_create_provider_anthropic(self) -> None:
+        provider = create_provider(_cfg("anthropic"))
         self.assertIsInstance(provider, AnthropicProvider)
 
-    def test_new_provider_openai(self) -> None:
-        provider = new_provider(_cfg("openai"))
+    def test_create_provider_openai(self) -> None:
+        provider = create_provider(_cfg("openai"))
         self.assertIsInstance(provider, OpenAIProvider)
+
+    def test_stream_options_keeps_unified_agent_shape(self) -> None:
+        options = StreamOptions(
+            temperature=0.2,
+            max_tokens=123,
+            api_key="key",
+            transport="auto",
+            cache_retention="short",
+            session_id="session",
+            headers={"x-test": "yes"},
+            timeout_ms=1000,
+            websocket_connect_timeout_ms=200,
+            max_retries=2,
+            max_retry_delay_ms=3000,
+            metadata={"user_id": "u1"},
+        )
+
+        self.assertEqual(options.api_key, "key")
+        self.assertEqual(options.transport, "auto")
+        self.assertEqual(options.cache_retention, "short")
+        self.assertEqual(options.session_id, "session")
+        self.assertEqual(options.headers, {"x-test": "yes"})
+        self.assertEqual(options.websocket_connect_timeout_ms, 200)
+        self.assertEqual(options.max_retry_delay_ms, 3000)
+        self.assertEqual(options.metadata, {"user_id": "u1"})
 
 
 class AnthropicProviderTests(unittest.TestCase):
@@ -36,19 +72,55 @@ class AnthropicProviderTests(unittest.TestCase):
             _cfg("anthropic", thinking=True), client=fake_client
         )
 
-        chunks = asyncio.run(_collect(provider.stream([Message("user", "hi")])))
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
 
-        self.assertEqual(
-            [event.thinking for event in chunks if event.thinking], ["hidden"]
-        )
-        self.assertEqual([event.text for event in chunks if event.text], ["visible"])
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(_deltas(chunks, "thinking_delta"), ["hidden"])
+        self.assertEqual(_deltas(chunks, "text_delta"), ["visible"])
+        self.assertEqual(chunks[-1].type, "done")
         request = fake_client.messages.requests[0]
         self.assertEqual(request["system"], SYSTEM_PROMPT)
         self.assertEqual(request["messages"], [{"role": "user", "content": "hi"}])
         self.assertEqual(
             request["thinking"], {"type": "enabled", "budget_tokens": 2048}
         )
+
+    def test_stream_options_map_safe_request_fields(self) -> None:
+        fake_client = FakeAnthropicClient([])
+        provider = AnthropicProvider(_cfg("anthropic"), client=fake_client)
+
+        chunks = asyncio.run(
+            _collect(
+                provider.stream(
+                    _context("hi"),
+                    StreamOptions(temperature=0.2, max_tokens=123),
+                )
+            )
+        )
+
+        self.assertEqual(chunks[-1].type, "done")
+        request = fake_client.messages.requests[0]
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertEqual(request["max_tokens"], 123)
+
+    def test_stream_error_includes_diagnostics(self) -> None:
+        provider = AnthropicProvider(
+            _cfg("anthropic"),
+            client=FailingAnthropicClient(RuntimeError("boom")),
+        )
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(chunks[-1].type, "error")
+        error = chunks[-1].error
+        self.assertEqual(error.stop_reason, "error")
+        self.assertEqual(error.error_message, "boom")
+        self.assertEqual(len(error.diagnostics), 1)
+        diagnostic = error.diagnostics[0]
+        self.assertEqual(diagnostic.type, "provider_stream_error")
+        self.assertIsInstance(diagnostic.timestamp, int)
+        self.assertIsNotNone(diagnostic.error)
+        self.assertEqual(diagnostic.error.message, "boom")
+        self.assertEqual(diagnostic.error.name, "RuntimeError")
 
     def test_stream_ignores_raw_delta_to_avoid_duplicate_text(self) -> None:
         events = [
@@ -61,10 +133,10 @@ class AnthropicProviderTests(unittest.TestCase):
         fake_client = FakeAnthropicClient(events)
         provider = AnthropicProvider(_cfg("anthropic"), client=fake_client)
 
-        chunks = asyncio.run(_collect(provider.stream([Message("user", "hi")])))
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
 
-        self.assertEqual([event.text for event in chunks if event.text], ["visible"])
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(_deltas(chunks, "text_delta"), ["visible"])
+        self.assertEqual(chunks[-1].type, "done")
 
     def test_constructor_passes_base_url_when_present(self) -> None:
         with patch("agentcode.llm.anthropic_provider.AsyncAnthropic", FakeAnthropicSDK):
@@ -95,8 +167,7 @@ class AnthropicProviderTests(unittest.TestCase):
         chunks = asyncio.run(
             _collect(
                 provider.stream(
-                    [Message("user", "read spec")],
-                    [_tool_definition()],
+                    _context("read spec", [_tool_definition()]),
                 )
             )
         )
@@ -117,14 +188,27 @@ class AnthropicProviderTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [event.tool_calls for event in chunks if event.tool_calls],
-            [[ToolCall(id="call_1", name="read", input='{"path": "spec.md"}')]],
+            _tool_calls(chunks),
+            [ToolCall(id="call_1", name="read", arguments={"path": "spec.md"})],
         )
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(chunks[-1].reason, "toolUse")
+        self.assertEqual(chunks[-1].type, "done")
+        self.assertIsNotNone(chunks[-1].message)
+        self.assertEqual(chunks[-1].message.api, "anthropic-messages")
+        self.assertEqual(chunks[-1].message.provider, "anthropic")
+        self.assertEqual(
+            assistant_tool_calls(chunks[-1].message),
+            [ToolCall(id="call_1", name="read", arguments={"path": "spec.md"})],
+        )
 
     def test_stream_maps_tool_history_and_disables_thinking(self) -> None:
-        call = ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')
-        result = ToolResult(tool_call_id="call_1", content="content", is_error=False)
+        call = ToolCall(id="call_1", name="read", arguments={"path": "spec.md"})
+        result = ToolResultMessage(
+            tool_call_id="call_1",
+            tool_name="read",
+            content=[TextContent(text="content")],
+            is_error=False,
+        )
         fake_client = FakeAnthropicClient([])
         provider = AnthropicProvider(
             _cfg("anthropic", thinking=True), client=fake_client
@@ -133,15 +217,19 @@ class AnthropicProviderTests(unittest.TestCase):
         chunks = asyncio.run(
             _collect(
                 provider.stream(
-                    [
-                        Message("assistant", "Reading.", tool_calls=[call]),
-                        Message("tool", tool_results=[result]),
-                    ]
+                    Context(
+                        messages=[
+                            AssistantMessage(
+                                content=[TextContent(text="Reading."), call]
+                            ),
+                            result,
+                        ]
+                    )
                 )
             )
         )
 
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(chunks[-1].type, "done")
         request = fake_client.messages.requests[0]
         self.assertNotIn("thinking", request)
         self.assertEqual(
@@ -185,10 +273,10 @@ class OpenAIProviderTests(unittest.TestCase):
         )
         provider = OpenAIProvider(_cfg("openai"), client=fake_client)
 
-        chunks = asyncio.run(_collect(provider.stream([Message("user", "hi")])))
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
 
-        self.assertEqual([event.text for event in chunks if event.text], ["hello"])
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(_deltas(chunks, "text_delta"), ["hello"])
+        self.assertEqual(chunks[-1].type, "done")
         request = fake_client.chat.completions.requests[0]
         self.assertEqual(request["model"], "test-model")
         self.assertEqual(
@@ -198,6 +286,44 @@ class OpenAIProviderTests(unittest.TestCase):
                 {"role": "user", "content": "hi"},
             ],
         )
+
+    def test_stream_options_map_safe_request_fields(self) -> None:
+        fake_client = FakeOpenAIClient([])
+        provider = OpenAIProvider(_cfg("openai"), client=fake_client)
+
+        chunks = asyncio.run(
+            _collect(
+                provider.stream(
+                    _context("hi"),
+                    StreamOptions(temperature=0.2, max_tokens=123),
+                )
+            )
+        )
+
+        self.assertEqual(chunks[-1].type, "done")
+        request = fake_client.chat.completions.requests[0]
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertEqual(request["max_tokens"], 123)
+
+    def test_stream_error_includes_diagnostics(self) -> None:
+        provider = OpenAIProvider(
+            _cfg("openai"),
+            client=FailingOpenAIClient(RuntimeError("boom")),
+        )
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(chunks[-1].type, "error")
+        error = chunks[-1].error
+        self.assertEqual(error.stop_reason, "error")
+        self.assertEqual(error.error_message, "boom")
+        self.assertEqual(len(error.diagnostics), 1)
+        diagnostic = error.diagnostics[0]
+        self.assertEqual(diagnostic.type, "provider_stream_error")
+        self.assertIsInstance(diagnostic.timestamp, int)
+        self.assertIsNotNone(diagnostic.error)
+        self.assertEqual(diagnostic.error.message, "boom")
+        self.assertEqual(diagnostic.error.name, "RuntimeError")
 
     def test_stream_extracts_reasoning_delta_separately(self) -> None:
         fake_client = FakeOpenAIClient(
@@ -216,12 +342,10 @@ class OpenAIProviderTests(unittest.TestCase):
         )
         provider = OpenAIProvider(_cfg("openai"), client=fake_client)
 
-        chunks = asyncio.run(_collect(provider.stream([Message("user", "hi")])))
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
 
-        self.assertEqual(
-            [event.thinking for event in chunks if event.thinking], ["thinking"]
-        )
-        self.assertEqual([event.text for event in chunks if event.text], ["answer"])
+        self.assertEqual(_deltas(chunks, "thinking_delta"), ["thinking"])
+        self.assertEqual(_deltas(chunks, "text_delta"), ["answer"])
 
     def test_constructor_passes_base_url_when_present(self) -> None:
         with patch("agentcode.llm.openai_provider.AsyncOpenAI", FakeOpenAISDK):
@@ -280,8 +404,7 @@ class OpenAIProviderTests(unittest.TestCase):
         chunks = asyncio.run(
             _collect(
                 provider.stream(
-                    [Message("user", "read spec")],
-                    [_tool_definition()],
+                    _context("read spec", [_tool_definition()]),
                 )
             )
         )
@@ -305,29 +428,42 @@ class OpenAIProviderTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [event.tool_calls for event in chunks if event.tool_calls],
-            [[ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')]],
+            _tool_calls(chunks),
+            [ToolCall(id="call_1", name="read", arguments={"path": "spec.md"})],
         )
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(chunks[-1].reason, "toolUse")
+        self.assertEqual(chunks[-1].type, "done")
+        self.assertIsNotNone(chunks[-1].message)
+        self.assertEqual(chunks[-1].message.api, "openai-completions")
+        self.assertEqual(chunks[-1].message.provider, "openai")
 
     def test_stream_maps_tool_history(self) -> None:
-        call = ToolCall(id="call_1", name="read", input='{"path":"spec.md"}')
-        result = ToolResult(tool_call_id="call_1", content="content", is_error=False)
+        call = ToolCall(id="call_1", name="read", arguments={"path": "spec.md"})
+        result = ToolResultMessage(
+            tool_call_id="call_1",
+            tool_name="read",
+            content=[TextContent(text="content")],
+            is_error=False,
+        )
         fake_client = FakeOpenAIClient([])
         provider = OpenAIProvider(_cfg("openai"), client=fake_client)
 
         chunks = asyncio.run(
             _collect(
                 provider.stream(
-                    [
-                        Message("assistant", "Reading.", tool_calls=[call]),
-                        Message("tool", tool_results=[result]),
-                    ]
+                    Context(
+                        messages=[
+                            AssistantMessage(
+                                content=[TextContent(text="Reading."), call]
+                            ),
+                            result,
+                        ]
+                    )
                 )
             )
         )
 
-        self.assertTrue(chunks[-1].done)
+        self.assertEqual(chunks[-1].type, "done")
         request = fake_client.chat.completions.requests[0]
         self.assertEqual(
             request["messages"],
@@ -393,11 +529,26 @@ class FakeAnthropicMessages:
         return FakeStream(self._events, final_message=self._final_message)
 
 
+class FailingAnthropicMessages:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.requests: list[dict[str, object]] = []
+
+    def stream(self, **kwargs: object) -> FakeStream:
+        self.requests.append(kwargs)
+        raise self._exc
+
+
 class FakeAnthropicClient:
     def __init__(
         self, events: list[object], final_message: object | None = None
     ) -> None:
         self.messages = FakeAnthropicMessages(events, final_message=final_message)
+
+
+class FailingAnthropicClient:
+    def __init__(self, exc: Exception) -> None:
+        self.messages = FailingAnthropicMessages(exc)
 
 
 class FakeAnthropicSDK(FakeAnthropicClient):
@@ -418,14 +569,34 @@ class FakeOpenAICompletions:
         return FakeAsyncIterator(self._events)
 
 
+class FailingOpenAICompletions:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.requests: list[dict[str, object]] = []
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        raise self._exc
+
+
 class FakeOpenAIChat:
     def __init__(self, events: list[object]) -> None:
         self.completions = FakeOpenAICompletions(events)
 
 
+class FailingOpenAIChat:
+    def __init__(self, exc: Exception) -> None:
+        self.completions = FailingOpenAICompletions(exc)
+
+
 class FakeOpenAIClient:
     def __init__(self, events: list[object]) -> None:
         self.chat = FakeOpenAIChat(events)
+
+
+class FailingOpenAIClient:
+    def __init__(self, exc: Exception) -> None:
+        self.chat = FailingOpenAIChat(exc)
 
 
 class FakeOpenAISDK(FakeOpenAIClient):
@@ -465,11 +636,23 @@ def _tool_definition() -> ToolDefinition:
     return ToolDefinition(
         name="read",
         description="Read file",
-        input_schema={
+        parameters={
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
         },
+    )
+
+
+def _context(
+    text: str,
+    tools: list[ToolDefinition] | None = None,
+    system_prompt: str | None = None,
+) -> Context:
+    return Context(
+        messages=[UserMessage(content=text)],
+        tools=tools,
+        system_prompt=system_prompt,
     )
 
 
@@ -478,6 +661,23 @@ async def _collect(stream: object) -> list[object]:
     async for event in stream:  # type: ignore[attr-defined]
         events.append(event)
     return events
+
+
+def _deltas(events: list[object], event_type: str) -> list[str]:
+    return [
+        str(getattr(event, "delta", ""))
+        for event in events
+        if getattr(event, "type", None) == event_type
+    ]
+
+
+def _tool_calls(events: list[object]) -> list[ToolCall]:
+    return [
+        event.tool_call
+        for event in events
+        if getattr(event, "type", None) == "toolcall_end"
+        and event.tool_call is not None
+    ]
 
 
 if __name__ == "__main__":

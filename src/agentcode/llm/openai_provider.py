@@ -1,12 +1,14 @@
 """
 OpenAI 协议适配器。
 
-封装 AsyncOpenAI chat.completions 流式接口，并把文本增量转换为统一 StreamEvent。
+封装 AsyncOpenAI chat.completions 流式接口，并把文本、thinking 和工具调用转换为
+统一 AssistantMessageEvent。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,14 +16,41 @@ from openai import AsyncOpenAI
 
 from agentcode.config import ProviderConfig
 from agentcode.llm import (
-    ROLE_ASSISTANT,
-    ROLE_TOOL,
+    AssistantContent,
+    AssistantMessage,
+    AssistantMessageDiagnostic,
+    AssistantMessageEvent,
+    Context,
+    DoneEvent,
+    DoneStopReason,
+    ErrorEvent,
+    ImageContent,
     Message,
-    StreamEvent,
+    ModelStopReason,
+    StartEvent,
+    StreamOptions,
+    TextContent,
+    TextDeltaEvent,
+    TextEndEvent,
+    TextStartEvent,
+    ThinkingDeltaEvent,
+    ThinkingEndEvent,
+    ThinkingStartEvent,
     ToolCall,
+    ToolCallEndEvent,
+    ToolCallStartEvent,
     ToolDefinition,
+    ToolResultMessage,
+    Usage,
+    assistant_tool_calls,
+    diagnostic_from_exception,
+    thinking_content,
+    tool_result_text,
 )
 from agentcode.prompt import SYSTEM_PROMPT
+
+OPENAI_COMPLETIONS_API = "openai-completions"
+OPENAI_PROVIDER = "openai"
 
 
 class OpenAIProvider:
@@ -30,6 +59,12 @@ class OpenAIProvider:
 
         self._cfg = cfg
         self._client: Any = client or _new_client(cfg)
+
+    @property
+    def api(self) -> str:
+        """返回 provider 使用的 API 协议名。"""
+
+        return OPENAI_COMPLETIONS_API
 
     @property
     def name(self) -> str:
@@ -44,75 +79,250 @@ class OpenAIProvider:
         return self._cfg.model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition] | None = None
-    ) -> AsyncIterator[StreamEvent]:
-        """调用 chat.completions 流式接口，并统一文本、thinking 和工具调用事件。"""
+        self, context: Context, options: StreamOptions | None = None
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        """调用 chat.completions 流式接口，并转换为统一 assistant 事件。"""
 
-        # OpenAI chat.completions 需要把 system prompt 放进 messages 第一项。
-        messages: list[Any] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for message in msgs:
+        stream_options = options or StreamOptions()
+        messages: list[Any] = [
+            {"role": "system", "content": context.system_prompt or SYSTEM_PROMPT}
+        ]
+        for message in context.messages:
             messages.extend(_to_openai_messages(message))
         request: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
-        if tools:
-            request["tools"] = _to_openai_tools(tools)
+        if stream_options.temperature is not None:
+            request["temperature"] = stream_options.temperature
+        if stream_options.max_tokens is not None:
+            request["max_tokens"] = stream_options.max_tokens
+        if context.tools:
+            request["tools"] = _to_openai_tools(context.tools)
+
+        content: list[AssistantContent] = []
+        text = ""
+        thinking = ""
+        text_index: int | None = None
+        thinking_index: int | None = None
+        tool_calls_buf: dict[int, dict[str, str]] = {}
+        usage: Usage | None = None
+        stop_reason: ModelStopReason | None = None
+        response_id: str | None = None
+        response_model: str | None = None
+
+        yield StartEvent(partial=_assistant_message(self._cfg, content))
 
         try:
-            # SDK 已处理 SSE，适配器只负责抽取正文增量并统一成 StreamEvent。
             stream = await self._client.chat.completions.create(**request)
-            tool_calls_buf: dict[int, dict[str, str]] = {}
             async for chunk in stream:
+                response_id = _string_attr(chunk, "id") or response_id
+                response_model = _string_attr(chunk, "model") or response_model
+                chunk_usage = _extract_usage(chunk)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                chunk_stop_reason = _extract_stop_reason(chunk)
+                if chunk_stop_reason is not None:
+                    stop_reason = chunk_stop_reason
                 _merge_tool_call_deltas(chunk, tool_calls_buf)
-                thinking = _extract_thinking_delta(chunk)
-                if thinking:
-                    yield StreamEvent(thinking=thinking)
-                text = _extract_text_delta(chunk)
-                if text:
-                    yield StreamEvent(text=text)
+
+                thinking_delta = _extract_thinking_delta(chunk)
+                if thinking_delta:
+                    if thinking_index is None:
+                        thinking_index = len(content)
+                        content.append(thinking_content(""))
+                        yield ThinkingStartEvent(
+                            content_index=thinking_index,
+                            partial=_assistant_message(self._cfg, content),
+                        )
+                    thinking += thinking_delta
+                    content[thinking_index] = thinking_content(thinking)
+                    yield ThinkingDeltaEvent(
+                        content_index=thinking_index,
+                        delta=thinking_delta,
+                        partial=_assistant_message(self._cfg, content),
+                    )
+
+                text_delta = _extract_text_delta(chunk)
+                if text_delta:
+                    if text_index is None:
+                        text_index = len(content)
+                        content.append(TextContent(text=""))
+                        yield TextStartEvent(
+                            content_index=text_index,
+                            partial=_assistant_message(self._cfg, content),
+                        )
+                    text += text_delta
+                    content[text_index] = TextContent(text=text)
+                    yield TextDeltaEvent(
+                        content_index=text_index,
+                        delta=text_delta,
+                        partial=_assistant_message(self._cfg, content),
+                    )
+
+            if thinking_index is not None:
+                yield ThinkingEndEvent(
+                    content_index=thinking_index,
+                    content=thinking,
+                    partial=_assistant_message(self._cfg, content),
+                )
+            if text_index is not None:
+                yield TextEndEvent(
+                    content_index=text_index,
+                    content=text,
+                    partial=_assistant_message(self._cfg, content),
+                )
+
             calls = _build_tool_calls(tool_calls_buf)
-            if calls:
-                yield StreamEvent(tool_calls=calls)
-            yield StreamEvent(done=True)
+            for call in calls:
+                content_index = len(content)
+                content.append(call)
+                partial = _assistant_message(self._cfg, content)
+                yield ToolCallStartEvent(
+                    content_index=content_index,
+                    partial=partial,
+                )
+                yield ToolCallEndEvent(
+                    content_index=content_index,
+                    tool_call=call,
+                    partial=partial,
+                )
+
+            if calls and stop_reason is None:
+                stop_reason = "toolUse"
+            stop_reason = stop_reason or "stop"
+            message = _assistant_message(
+                self._cfg,
+                content,
+                usage=usage,
+                stop_reason=stop_reason,
+                response_id=response_id,
+                response_model=response_model,
+            )
+            if stop_reason in ("error", "aborted"):
+                yield ErrorEvent(reason=stop_reason, error=message)
+            else:
+                yield DoneEvent(reason=_done_reason(stop_reason), message=message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - Provider 将 SDK 错误传回 UI 展示。
-            yield StreamEvent(err=exc)
+            error = _assistant_message(
+                self._cfg,
+                content,
+                stop_reason="error",
+                error_message=str(exc),
+                diagnostics=[
+                    diagnostic_from_exception("provider_stream_error", exc)
+                ],
+            )
+            yield ErrorEvent(
+                reason="error",
+                error=error,
+                err=exc,
+            )
+
+
+def _assistant_message(
+    cfg: ProviderConfig,
+    content: list[AssistantContent],
+    usage: Usage | None = None,
+    stop_reason: ModelStopReason = "stop",
+    error_message: str | None = None,
+    response_id: str | None = None,
+    response_model: str | None = None,
+    diagnostics: list[AssistantMessageDiagnostic] | None = None,
+) -> AssistantMessage:
+    """用 provider 配置补齐统一 AssistantMessage 元数据。"""
+
+    return AssistantMessage(
+        content=list(content),
+        api=OPENAI_COMPLETIONS_API,
+        provider=OPENAI_PROVIDER,
+        model=cfg.model,
+        response_model=response_model,
+        response_id=response_id,
+        diagnostics=diagnostics or [],
+        usage=usage or Usage(),
+        stop_reason=stop_reason,
+        error_message=error_message,
+    )
+
+
+def _done_reason(reason: ModelStopReason) -> DoneStopReason:
+    """收窄 OpenAI 正常结束原因，避免 done 事件携带 error/aborted。"""
+
+    if reason in ("stop", "length", "toolUse"):
+        return reason
+    return "stop"
 
 
 def _to_openai_messages(message: Message) -> list[dict[str, Any]]:
     """把内部 Message 转成 OpenAI chat.completions 消息片段。"""
 
-    if message.role == ROLE_TOOL:
+    if isinstance(message, ToolResultMessage):
         return [
             {
                 "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": result.content,
-            }
-            for result in message.tool_results
-        ]
-    if message.role == ROLE_ASSISTANT and message.tool_calls:
-        return [
-            {
-                "role": "assistant",
-                "content": message.content or None,
-                "tool_calls": [
-                    {
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": call.input or "{}",
-                        },
-                    }
-                    for call in message.tool_calls
-                ],
+                "tool_call_id": message.tool_call_id,
+                "content": tool_result_text(message),
             }
         ]
-    return [{"role": message.role, "content": message.content}]
+    if isinstance(message, AssistantMessage):
+        text = _assistant_openai_text(message)
+        calls = assistant_tool_calls(message)
+        if calls:
+            return [
+                {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": _json_arguments(call.arguments),
+                            },
+                        }
+                        for call in calls
+                    ],
+                }
+            ]
+        return [{"role": "assistant", "content": text}]
+    return [{"role": message.role, "content": _to_openai_user_content(message.content)}]
+
+
+def _assistant_openai_text(message: AssistantMessage) -> str:
+    """提取可 replay 给 OpenAI 的 assistant 文本，thinking block 不回放。"""
+
+    return "\n".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+
+
+def _to_openai_user_content(content: object) -> object:
+    """转换 user content；字符串保持原样，block 列表转成 OpenAI 多模态格式。"""
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, TextContent):
+            blocks.append({"type": "text", "text": block.text})
+        elif isinstance(block, ImageContent):
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{block.mime_type};base64,{block.data}",
+                    },
+                }
+            )
+    return blocks
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -124,7 +334,7 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": tool.parameters,
             },
         }
         for tool in tools
@@ -134,7 +344,6 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 def _new_client(cfg: ProviderConfig) -> AsyncOpenAI:
     """创建 AsyncOpenAI 客户端，并支持 OpenAI 兼容 base_url。"""
 
-    # base_url 支持 OpenAI 兼容端点，例如代理或第三方兼容服务。
     if cfg.base_url:
         return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
     return AsyncOpenAI(api_key=cfg.api_key)
@@ -164,6 +373,65 @@ def _extract_thinking_delta(chunk: Any) -> str:
     return ""
 
 
+def _extract_usage(chunk: Any) -> Usage | None:
+    """从 OpenAI 流式 chunk 中提取统一 token 用量。"""
+
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return None
+    input_tokens = _int_attr(usage, "prompt_tokens", "input_tokens")
+    output_tokens = _int_attr(usage, "completion_tokens", "output_tokens")
+    total_tokens = _int_attr(usage, "total_tokens") or input_tokens + output_tokens
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = _int_attr(prompt_details, "cached_tokens")
+    return Usage(
+        input=input_tokens,
+        output=output_tokens,
+        cache_read=cache_read,
+        total_tokens=total_tokens,
+    )
+
+
+def _extract_stop_reason(chunk: Any) -> ModelStopReason | None:
+    """从 OpenAI chunk 的 finish_reason 映射出内部停止原因。"""
+
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return None
+    raw = getattr(choices[0], "finish_reason", None)
+    if raw == "tool_calls":
+        return "toolUse"
+    if raw == "length":
+        return "length"
+    if raw == "stop":
+        return "stop"
+    if raw == "content_filter":
+        return "error"
+    return None
+
+
+def _int_attr(obj: Any, *names: str) -> int:
+    """按多个候选字段安全读取整数属性，缺失或 None 时返回 0。"""
+
+    if obj is None:
+        return 0
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return int(value)
+    return 0
+
+
+def _string_attr(obj: Any | None, name: str) -> str | None:
+    """安全读取 SDK 对象上的字符串属性，空值统一视为不存在。"""
+
+    value = getattr(obj, name, None)
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
 def _merge_tool_call_deltas(
     chunk: Any, tool_calls_buf: dict[int, dict[str, str]]
 ) -> None:
@@ -191,7 +459,7 @@ def _merge_tool_call_deltas(
 
 
 def _build_tool_calls(tool_calls_buf: dict[int, dict[str, str]]) -> list[ToolCall]:
-    """在流结束后把工具调用缓冲区转换为协议无关 ToolCall。"""
+    """在流结束后把工具调用缓冲区转换为统一 ToolCall block。"""
 
     calls: list[ToolCall] = []
     for index in sorted(tool_calls_buf):
@@ -203,7 +471,23 @@ def _build_tool_calls(tool_calls_buf: dict[int, dict[str, str]]) -> list[ToolCal
             ToolCall(
                 id=item.get("id", f"call_{index}"),
                 name=name,
-                input=item.get("args") or "{}",
+                arguments=_json_object(item.get("args") or "{}"),
             )
         )
     return calls
+
+
+def _json_arguments(arguments: dict[str, Any]) -> str:
+    """把 ToolCall.arguments 稳定序列化为 OpenAI 所需 JSON 字符串。"""
+
+    return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_object(raw: str) -> dict[str, Any]:
+    """把 OpenAI function arguments 字符串解析成统一对象参数。"""
+
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}

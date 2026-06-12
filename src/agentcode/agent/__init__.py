@@ -1,45 +1,84 @@
 """
 AgentCode 的底层 Agent Core。
 
-负责单轮模型请求、工具执行、工具结果回灌和生命周期事件输出；不处理 TUI、
-配置加载、会话持久化或用户输入命令。
+负责 ReAct 循环、模型流式收集、工具分批执行和生命周期事件输出；不处理
+TUI、配置加载、会话持久化或用户输入命令。
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import json
 from typing import Literal
 
 from agentcode.conversation import Conversation
 from agentcode.llm import (
-    ROLE_ASSISTANT,
-    ROLE_TOOL,
+    AssistantMessage,
+    Context,
+    DoneEvent,
+    ErrorEvent,
     Message,
     Provider,
+    TextDeltaEvent,
+    ThinkingDeltaEvent,
     ToolCall,
-    ToolResult,
+    ToolResultMessage,
+    Usage,
+    assistant_tool_calls,
+    text_content,
 )
-from agentcode.tool import DEFAULT_TIMEOUT, Registry
+from agentcode.tool import (
+    DEFAULT_TIMEOUT,
+    ExecutionMode,
+    Registry,
+    ToolResult,
+    content_text,
+    text_result,
+)
 
 TOOL_ARG_PREVIEW_CHARS = 80
-SINGLE_TOOL_ROUND_LIMIT_MESSAGE = "本轮已达到单轮工具调用上限，未继续执行新的工具请求。"
+DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_UNKNOWN_TOOLS = 2
+MAX_ITERATIONS_MESSAGE = "已达到本轮 Agent Loop 迭代上限，已停止继续调用工具。"
+UNKNOWN_TOOL_LIMIT_MESSAGE = "连续请求未知工具，Agent Loop 已停止。"
 
 EventType = Literal[
+    "turn_start",
     "message_start",
     "message_update",
     "message_end",
     "tool_execution_start",
+    "tool_execution_update",
     "tool_execution_end",
     "turn_end",
     "agent_end",
+    "progress",
+    "usage",
     "error",
+]
+StopReason = Literal[
+    "completed",
+    "max_iterations",
+    "unknown_tool_limit",
+    "error",
+    "cancelled",
+    "tool_terminated",
 ]
 
 
 @dataclass(frozen=True, slots=True)
+class AgentRunOptions:
+    """控制一次 Agent Loop 的安全边界。"""
+
+    max_iterations: int = DEFAULT_MAX_ITERATIONS
+    max_unknown_tools: int = DEFAULT_MAX_UNKNOWN_TOOLS
+
+
+@dataclass(frozen=True, slots=True)
 class AgentEvent:
-    """Agent Core 对外输出的 pi 风格生命周期事件。"""
+    """Agent Core 对外输出的统一生命周期事件。"""
 
     type: EventType
     message: Message | None = None
@@ -50,11 +89,23 @@ class AgentEvent:
     args: str = ""
     result: str = ""
     is_error: bool = False
+    usage: Usage | None = None
+    progress: str = ""
+    stop_reason: StopReason | None = None
     err: Exception | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolOutcome:
+    """一个工具调用执行完成后需要回灌给模型的结果。"""
+
+    call: ToolCall
+    result: ToolResult
+    args_preview: str
+
+
 class Agent:
-    """执行一次用户回合中的模型请求和单轮工具调用。"""
+    """执行一次用户回合中的 ReAct Agent Loop。"""
 
     def __init__(self, provider: Provider, registry: Registry) -> None:
         """绑定本回合要使用的模型 provider 和工具注册中心。"""
@@ -62,121 +113,311 @@ class Agent:
         self._provider = provider
         self._registry = registry
 
-    async def run(self, conv: Conversation) -> AsyncIterator[AgentEvent]:
-        """从已有对话历史继续执行当前回合。
+    async def run(
+        self,
+        conv: Conversation,
+        options: AgentRunOptions | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """从已有对话历史继续执行，直到模型停止请求工具或触发安全边界。"""
 
-        当前阶段只允许一次工具批次：模型拿到工具结果后可以续答，但如果再次请求
-        工具，会返回固定提示并停止，自动多轮 Agent Loop 留给下一阶段。
-        """
+        run_options = options or AgentRunOptions()
+        unknown_tool_turns = 0
+        iteration = 0
 
-        definitions = self._registry.definitions()
+        try:
+            while True:
+                if iteration >= run_options.max_iterations:
+                    for event in _append_stop_message(
+                        conv, MAX_ITERATIONS_MESSAGE, "max_iterations"
+                    ):
+                        yield event
+                    return
 
-        yield AgentEvent(
-            type="message_start",
-            message=Message(role=ROLE_ASSISTANT),
-        )
-        preamble = ""
-        calls: list[ToolCall] = []
-        async for stream_event in self._provider.stream(conv.messages(), definitions):
-            if stream_event.err is not None:
-                yield AgentEvent(type="error", err=stream_event.err)
-                return
-            if stream_event.thinking:
+                iteration += 1
                 yield AgentEvent(
-                    type="message_update",
-                    thinking=stream_event.thinking,
+                    type="turn_start",
+                    progress=f"开始第 {iteration} 轮 Agent Loop",
                 )
-            if stream_event.text:
-                preamble += stream_event.text
-                yield AgentEvent(type="message_update", text=stream_event.text)
-            if stream_event.tool_calls:
-                calls.extend(stream_event.tool_calls)
-
-        if not calls:
-            message = Message(role=ROLE_ASSISTANT, content=preamble)
-            conv.add_assistant(preamble)
-            yield AgentEvent(type="message_end", message=message)
-            yield AgentEvent(type="turn_end", message=message)
-            yield AgentEvent(type="agent_end")
-            return
-
-        assistant_message = Message(
-            role=ROLE_ASSISTANT,
-            content=preamble,
-            tool_calls=list(calls),
-        )
-        conv.add_assistant_with_tool_calls(preamble, calls)
-        yield AgentEvent(type="message_end", message=assistant_message)
-
-        results: list[ToolResult] = []
-        for call in calls:
-            args_preview = _preview_args(call.input)
-            yield AgentEvent(
-                type="tool_execution_start",
-                tool_call_id=call.id,
-                tool_name=call.name,
-                args=args_preview,
-            )
-            result = await self._registry.execute(
-                call.name, call.input, timeout=DEFAULT_TIMEOUT
-            )
-            yield AgentEvent(
-                type="tool_execution_end",
-                tool_call_id=call.id,
-                tool_name=call.name,
-                args=args_preview,
-                result=result.content,
-                is_error=result.is_error,
-            )
-            results.append(
-                ToolResult(
-                    tool_call_id=call.id,
-                    content=result.content,
-                    is_error=result.is_error,
-                )
-            )
-
-        tool_message = Message(role=ROLE_TOOL, tool_results=list(results))
-        conv.add_tool_results(results)
-        yield AgentEvent(type="message_start", message=tool_message)
-        yield AgentEvent(type="message_end", message=tool_message)
-
-        yield AgentEvent(
-            type="message_start",
-            message=Message(role=ROLE_ASSISTANT),
-        )
-        final = ""
-        requested_more_tools = False
-        async for stream_event in self._provider.stream(conv.messages(), definitions):
-            if stream_event.err is not None:
-                yield AgentEvent(type="error", err=stream_event.err)
-                return
-            if stream_event.thinking:
                 yield AgentEvent(
-                    type="message_update",
-                    thinking=stream_event.thinking,
+                    type="progress",
+                    progress=f"LLM streaming iteration {iteration}",
                 )
-            if stream_event.text:
-                final += stream_event.text
-                yield AgentEvent(type="message_update", text=stream_event.text)
-            if stream_event.tool_calls:
-                requested_more_tools = True
+                assistant_message: AssistantMessage | None = None
+                message_started = False
+                context = Context(
+                    messages=conv.messages(),
+                    tools=self._registry.definitions(),
+                )
+                async for stream_event in self._provider.stream(context):
+                    if stream_event.type == "start":
+                        message_started = True
+                        yield AgentEvent(
+                            type="message_start",
+                            message=stream_event.partial or AssistantMessage(),
+                        )
+                        continue
+                    if isinstance(stream_event, ErrorEvent):
+                        yield AgentEvent(
+                            type="error",
+                            err=stream_event.err,
+                            stop_reason="error",
+                        )
+                        yield AgentEvent(type="agent_end", stop_reason="error")
+                        return
+                    if isinstance(stream_event, ThinkingDeltaEvent) and stream_event.delta:
+                        yield AgentEvent(
+                            type="message_update",
+                            thinking=stream_event.delta,
+                        )
+                    if isinstance(stream_event, TextDeltaEvent) and stream_event.delta:
+                        yield AgentEvent(type="message_update", text=stream_event.delta)
+                    if isinstance(stream_event, DoneEvent):
+                        assistant_message = stream_event.message
 
-        if not final and requested_more_tools:
-            final = SINGLE_TOOL_ROUND_LIMIT_MESSAGE
-            yield AgentEvent(type="message_update", text=final)
+                if not message_started:
+                    yield AgentEvent(type="message_start", message=AssistantMessage())
+                if assistant_message is None:
+                    assistant_message = AssistantMessage(
+                        content=[text_content("模型没有返回有效响应。")],
+                        stop_reason="error",
+                        error_message="missing done event",
+                    )
+                yield AgentEvent(type="usage", usage=assistant_message.usage)
+                conv.add_assistant_message(assistant_message)
+                yield AgentEvent(type="message_end", message=assistant_message)
 
-        final_message = Message(role=ROLE_ASSISTANT, content=final)
-        conv.add_assistant(final)
-        yield AgentEvent(type="message_end", message=final_message)
-        yield AgentEvent(type="turn_end", message=final_message)
-        yield AgentEvent(type="agent_end")
+                tool_calls = assistant_tool_calls(assistant_message)
+                if not tool_calls:
+                    yield AgentEvent(type="turn_end", message=assistant_message)
+                    yield AgentEvent(type="agent_end", stop_reason="completed")
+                    return
+
+                unavailable = [
+                    call
+                    for call in tool_calls
+                    if not _tool_is_available(self._registry, call.name)
+                ]
+                unknown_tool_turns = unknown_tool_turns + 1 if unavailable else 0
+
+                outcomes: list[_ToolOutcome] = []
+                async for tool_event, outcome in _execute_tool_calls(
+                    self._registry,
+                    tool_calls,
+                ):
+                    if tool_event is not None:
+                        yield tool_event
+                    if outcome is not None:
+                        outcomes.append(outcome)
+
+                tool_results = [
+                    ToolResultMessage(
+                        tool_call_id=outcome.call.id,
+                        tool_name=outcome.call.name,
+                        content=outcome.result.content,
+                        details=outcome.result.details,
+                        is_error=outcome.result.is_error,
+                    )
+                    for outcome in outcomes
+                ]
+                conv.add_tool_results(tool_results)
+                for tool_message in tool_results:
+                    yield AgentEvent(type="message_start", message=tool_message)
+                    yield AgentEvent(type="message_end", message=tool_message)
+                yield AgentEvent(type="turn_end", message=assistant_message)
+
+                if outcomes and all(outcome.result.terminate for outcome in outcomes):
+                    yield AgentEvent(type="agent_end", stop_reason="tool_terminated")
+                    return
+
+                if unknown_tool_turns >= run_options.max_unknown_tools:
+                    for event in _append_stop_message(
+                        conv,
+                        UNKNOWN_TOOL_LIMIT_MESSAGE,
+                        "unknown_tool_limit",
+                    ):
+                        yield event
+                    return
+        except asyncio.CancelledError:
+            yield AgentEvent(type="agent_end", stop_reason="cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 - Core 兜底转换为事件，避免 UI 卡在 streaming。
+            yield AgentEvent(type="error", err=exc, stop_reason="error")
+            yield AgentEvent(type="agent_end", stop_reason="error")
 
 
-def _preview_args(args: str) -> str:
+async def _execute_tool_calls(
+    registry: Registry,
+    calls: list[ToolCall],
+) -> AsyncIterator[tuple[AgentEvent | None, _ToolOutcome | None]]:
+    """按工具安全策略分批执行，并保持结果回灌顺序稳定。"""
+
+    indexed_outcomes: list[tuple[int, _ToolOutcome]] = []
+    for batch in _tool_batches(registry, calls):
+        if _batch_execution_mode(registry, batch) == "parallel":
+            for _, call in batch:
+                yield _tool_start_event(call), None
+            results = await asyncio.gather(
+                *[
+                    _run_tool(registry, index, call)
+                    for index, call in batch
+                ]
+            )
+            for index, outcome, updates in results:
+                for update in updates:
+                    yield _tool_update_event(outcome.call, update), None
+                indexed_outcomes.append((index, outcome))
+                yield _tool_end_event(outcome), None
+            continue
+
+        for index, call in batch:
+            yield _tool_start_event(call), None
+            _, outcome, updates = await _run_tool(registry, index, call)
+            for update in updates:
+                yield _tool_update_event(outcome.call, update), None
+            indexed_outcomes.append((index, outcome))
+            yield _tool_end_event(outcome), None
+
+    for _, outcome in sorted(indexed_outcomes, key=lambda item: item[0]):
+        yield None, outcome
+
+
+def _tool_batches(
+    registry: Registry,
+    calls: list[ToolCall],
+) -> list[list[tuple[int, ToolCall]]]:
+    """把连续 parallel 工具合并为并发批，sequential 工具保持单独串行批。"""
+
+    batches: list[list[tuple[int, ToolCall]]] = []
+    current_parallel: list[tuple[int, ToolCall]] = []
+    for index, call in enumerate(calls):
+        if _call_execution_mode(registry, call) == "parallel":
+            current_parallel.append((index, call))
+            continue
+        if current_parallel:
+            batches.append(current_parallel)
+            current_parallel = []
+        batches.append([(index, call)])
+    if current_parallel:
+        batches.append(current_parallel)
+    return batches
+
+
+def _batch_execution_mode(
+    registry: Registry,
+    batch: list[tuple[int, ToolCall]],
+) -> ExecutionMode:
+    """返回批次执行模式；只有全部只读时才允许并发。"""
+
+    if all(_call_execution_mode(registry, call) == "parallel" for _, call in batch):
+        return "parallel"
+    return "sequential"
+
+
+def _call_execution_mode(
+    registry: Registry,
+    call: ToolCall,
+) -> ExecutionMode:
+    """返回单个工具调用的执行策略，未知工具按串行错误处理。"""
+
+    if not _tool_is_available(registry, call.name):
+        return "sequential"
+    return registry.execution_mode(call.name) or "sequential"
+
+
+async def _run_tool(
+    registry: Registry,
+    index: int,
+    call: ToolCall,
+) -> tuple[int, _ToolOutcome, list[ToolResult]]:
+    """执行单个工具调用，并把未知工具转成可回灌的错误结果。"""
+
+    updates: list[ToolResult] = []
+    if not _tool_is_available(registry, call.name):
+        result = text_result(f"未知工具: {call.name}", is_error=True)
+    else:
+        result = await registry.execute(
+            call.id,
+            call.name,
+            call.arguments,
+            timeout=DEFAULT_TIMEOUT,
+            on_update=updates.append,
+        )
+    return (
+        index,
+        _ToolOutcome(
+            call=call,
+            result=result,
+            args_preview=_preview_args(call.arguments),
+        ),
+        updates,
+    )
+
+
+def _tool_start_event(call: ToolCall) -> AgentEvent:
+    """生成工具执行开始事件。"""
+
+    return AgentEvent(
+        type="tool_execution_start",
+        tool_call_id=call.id,
+        tool_name=call.name,
+        args=_preview_args(call.arguments),
+    )
+
+
+def _tool_end_event(outcome: _ToolOutcome) -> AgentEvent:
+    """生成工具执行完成事件。"""
+
+    return AgentEvent(
+        type="tool_execution_end",
+        tool_call_id=outcome.call.id,
+        tool_name=outcome.call.name,
+        args=outcome.args_preview,
+        result=content_text(outcome.result.content),
+        is_error=outcome.result.is_error,
+    )
+
+
+def _tool_update_event(call: ToolCall, result: ToolResult) -> AgentEvent:
+    """生成工具执行过程更新事件。"""
+
+    return AgentEvent(
+        type="tool_execution_update",
+        tool_call_id=call.id,
+        tool_name=call.name,
+        args=_preview_args(call.arguments),
+        result=content_text(result.content),
+        is_error=result.is_error,
+    )
+
+
+def _tool_is_available(registry: Registry, name: str) -> bool:
+    """判断模型请求的工具是否已注册。"""
+
+    return registry.get(name) is not None
+
+
+def _append_stop_message(
+    conv: Conversation,
+    text: str,
+    stop_reason: StopReason,
+) -> list[AgentEvent]:
+    """追加安全停止提示，并生成结束事件。"""
+
+    message = AssistantMessage(content=[text_content(text)], stop_reason="stop")
+    conv.add_assistant(text)
+    return [
+        AgentEvent(type="message_start", message=AssistantMessage()),
+        AgentEvent(type="message_update", text=text),
+        AgentEvent(type="message_end", message=message),
+        AgentEvent(type="turn_end", message=message),
+        AgentEvent(type="agent_end", stop_reason=stop_reason),
+    ]
+
+
+def _preview_args(args: dict[str, object]) -> str:
     """生成工具参数的单行预览，避免 TUI 中长 JSON 撑开消息。"""
 
-    compact = " ".join((args or "{}").split())
+    compact = json.dumps(args or {}, ensure_ascii=False, separators=(",", ":"))
     if len(compact) <= TOOL_ARG_PREVIEW_CHARS:
         return compact
     return compact[: TOOL_ARG_PREVIEW_CHARS - 3] + "..."

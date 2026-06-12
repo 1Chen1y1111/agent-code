@@ -11,12 +11,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
-from agentcode.agent import Agent, AgentEvent, EventType
+from agentcode.agent import Agent, AgentEvent, EventType, StopReason
 from agentcode.conversation import Conversation
-from agentcode.llm import ROLE_USER, Message, Provider
+from agentcode.llm import Message, Provider, Usage, UserMessage
 from agentcode.tool import Registry
 
-SessionEventType = Literal["agent_start", "turn_start"] | EventType
+SessionEventType = Literal["agent_start"] | EventType
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +32,9 @@ class SessionEvent:
     args: str = ""
     result: str = ""
     is_error: bool = False
+    usage: Usage | None = None
+    progress: str = ""
+    stop_reason: StopReason | None = None
     err: Exception | None = None
 
     @classmethod
@@ -48,6 +51,9 @@ class SessionEvent:
             args=event.args,
             result=event.result,
             is_error=event.is_error,
+            usage=event.usage,
+            progress=event.progress,
+            stop_reason=event.stop_reason,
             err=event.err,
         )
 
@@ -70,11 +76,10 @@ class AgentSession:
     async def prompt(self, text: str) -> AsyncIterator[SessionEvent]:
         """提交一条用户输入，并产出用户消息和 Agent Core 的完整事件流。"""
 
-        user_message = Message(role=ROLE_USER, content=text)
+        user_message = UserMessage(content=text)
         self._conversation.add_user(text)
 
         yield SessionEvent(type="agent_start")
-        yield SessionEvent(type="turn_start")
         yield SessionEvent(type="message_start", message=user_message)
         yield SessionEvent(type="message_end", message=user_message)
 

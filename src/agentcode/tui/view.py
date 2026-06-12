@@ -18,28 +18,42 @@ def user_block(text: str) -> Text:
     return Text(f"● {text} \n", style="bold cyan")
 
 
-def assistant_markdown(text: str) -> Markdown:
+def assistant_final(thinking: str, text: str, hide_thinking: bool) -> RenderableType:
     """把助手最终回复渲染为 Markdown。"""
 
-    # 助手回复结束后再整体 Markdown 渲染，避免流式阶段代码块反复重排。
-    return Markdown(text or " ")
-
-
-def assistant_live(thinking: str, text: str, hide_thinking: bool) -> RenderableType:
-    """渲染流式中的助手消息，包括可隐藏的 thinking 通道。"""
-
-    parts: list[RenderableType] = []
-    if thinking:
-        if hide_thinking:
-            parts.append(Text("  Thinking...\n", style="dim italic"))
-        else:
-            # thinking 用独立样式展示，但不参与最终回答 Markdown 解析。
-            parts.append(Text(f"  {thinking.strip()}\n", style="dim italic"))
+    parts = _thinking_parts(thinking, hide_thinking)
     if text:
-        parts.append(assistant_markdown(text))
+        if not parts:
+            return Markdown(text)
+        parts.append(Markdown(text))
     if not parts:
-        return assistant_markdown("")
+        return Markdown(" ")
     return Group(*parts)
+
+
+def assistant_streaming(
+    thinking: str, text: str, hide_thinking: bool
+) -> RenderableType:
+    """渲染流式中的助手消息，回复正文先按纯文本展示。"""
+
+    parts = _thinking_parts(thinking, hide_thinking)
+    if text:
+        if not parts:
+            return Text(text)
+        parts.append(Text(text))
+    if not parts:
+        return Text(" ")
+    return Group(*parts)
+
+
+def _thinking_parts(thinking: str, hide_thinking: bool) -> list[RenderableType]:
+    """生成 thinking 展示片段，保证它不进入 Markdown 解析。"""
+
+    if not thinking:
+        return []
+    if hide_thinking:
+        return [Text("Thinking...\n", style="dim italic")]
+    return [Text(f"{thinking.strip()}\n", style="dim italic")]
 
 
 def working_text(frame: str) -> Text:

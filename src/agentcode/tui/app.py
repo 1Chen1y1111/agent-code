@@ -7,6 +7,7 @@ AgentCode 的 Textual TUI 主应用。
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from enum import Enum
 from pathlib import Path
@@ -21,14 +22,15 @@ from textual.widgets.option_list import Option
 
 from agentcode import __version__
 from agentcode.config import ProviderConfig
-from agentcode.llm import ROLE_USER, Provider, new_provider
+from agentcode.llm import ROLE_USER, Provider, create_provider, message_text
 from agentcode.prompt import render_banner
 from agentcode.session import AgentSession
-from agentcode.tool import Registry, new_default_registry
+from agentcode.tool import Registry, create_default_registry
 from agentcode.tui.input import ChatInput
 from agentcode.tui.scrollbar import install_scrollbar_renderer
 from agentcode.tui.view import (
-    assistant_live,
+    assistant_final,
+    assistant_streaming,
     elapsed_block,
     error_block,
     status_text,
@@ -170,7 +172,7 @@ class AgentCodeApp(App[None]):
         super().__init__()
         install_scrollbar_renderer()
         self.providers = providers
-        self._tool_registry = registry or new_default_registry()
+        self._tool_registry = registry or create_default_registry()
         self.provider: Provider | None = None
         self.agent_session: AgentSession | None = None
         self._agent_session_provider: Provider | None = None
@@ -216,7 +218,7 @@ class AgentCodeApp(App[None]):
             classes="message banner-message",
         )
         if len(self.providers) == 1:
-            self.provider = new_provider(self.providers[0])
+            self.provider = create_provider(self.providers[0])
             self._ensure_agent_session()
             self.state = SessionState.IDLE
         self._sync_visibility()
@@ -224,6 +226,7 @@ class AgentCodeApp(App[None]):
         self._update_statusbar()
         if self.state is SessionState.IDLE:
             self._focus_input()
+            self.call_after_refresh(self._focus_input)
         else:
             self.query_one("#selector", OptionList).focus()
 
@@ -232,7 +235,7 @@ class AgentCodeApp(App[None]):
     ) -> None:
         """用户选中 provider 后创建会话并切换到聊天界面。"""
 
-        self.provider = new_provider(self.providers[event.option_index])
+        self.provider = create_provider(self.providers[event.option_index])
         self._ensure_agent_session()
         self.state = SessionState.IDLE
         self._sync_visibility()
@@ -298,7 +301,7 @@ class AgentCodeApp(App[None]):
                     and event.message.role == ROLE_USER
                 ):
                     await self._append_chat(
-                        user_block(event.message.content),
+                        user_block(message_text(event.message)),
                         classes="message user-message",
                     )
                 if event.type == "message_update" and event.thinking:
@@ -374,9 +377,9 @@ class AgentCodeApp(App[None]):
         """在正常结束时补齐最终助手消息、耗时块并恢复输入状态。"""
 
         if self.cur_reply or self.cur_thinking:
-            await self._update_assistant_live()
+            await self._update_assistant_final()
         await self._append_chat(
-            elapsed_block(self._elapsed_seconds()),
+            elapsed_block(self._final_elapsed_seconds()),
             classes="message elapsed-message",
         )
         await self._finish_turn()
@@ -405,6 +408,8 @@ class AgentCodeApp(App[None]):
         input_box = self.query_one("#input", ChatInput)
         input_box.disabled = False
         self._focus_input()
+        # Working 消失会改变聊天区最终高度；刷新后再滚一次，避免停在旧的最大滚动位置。
+        self.call_after_refresh(self._scroll_chat_to_end)
 
     async def action_quit(self) -> None:
         """处理退出快捷键，并取消仍在运行的流式任务。"""
@@ -454,9 +459,30 @@ class AgentCodeApp(App[None]):
         self._scroll_chat_to_end()
 
     def _assistant_renderable(self) -> RenderableType:
-        """根据当前 thinking/text 缓冲生成助手消息 renderable。"""
+        """根据当前 thinking/text 缓冲生成流式助手消息 renderable。"""
 
-        return assistant_live(self.cur_thinking, self.cur_reply, self.hide_thinking)
+        return assistant_streaming(
+            self.cur_thinking,
+            self.cur_reply,
+            self.hide_thinking,
+        )
+
+    async def _update_assistant_final(self) -> None:
+        """把当前助手消息切换为最终 Markdown 渲染。"""
+
+        renderable = assistant_final(
+            self.cur_thinking,
+            self.cur_reply,
+            self.hide_thinking,
+        )
+        if self._active_assistant is None:
+            self._active_assistant = await self._append_chat(
+                renderable,
+                classes="message assistant-message",
+            )
+            return
+        self._active_assistant.update_renderable(renderable)
+        self._scroll_chat_to_end()
 
     async def _show_working(self) -> None:
         """显示或刷新聊天流末尾的 Working 临时消息。"""
@@ -464,7 +490,7 @@ class AgentCodeApp(App[None]):
         renderable = working_text(WORKING_FRAMES[self._working_frame_index])
         if self._working_widget is None:
             # working 是聊天流的一条临时消息，而不是固定在输入框上方的状态栏；
-            # 新消息追加时会先移除再挂回末尾，从而保持 pi 一样的滚动语义。
+            # 新消息追加时会先移除再挂回末尾，从而保持自然的滚动语义。
             self._working_widget = MessageWidget(
                 renderable,
                 classes="message working-message",
@@ -514,9 +540,16 @@ class AgentCodeApp(App[None]):
         self.query_one("#input", ChatInput).focus()
 
     def _elapsed_seconds(self) -> int:
-        """返回当前回合从提交到现在的整数秒耗时。"""
+        """返回当前回合的实时整数耗时，用于运行中状态。"""
 
         return int(time.monotonic() - self.turn_start) if self.turn_start else 0
+
+    def _final_elapsed_seconds(self) -> int:
+        """返回最终展示耗时，短请求也至少显示 1 秒。"""
+
+        if not self.turn_start:
+            return 0
+        return max(1, math.ceil(time.monotonic() - self.turn_start))
 
     def _ensure_agent_session(self) -> AgentSession | None:
         """确保当前 provider 对应的进程内 AgentSession 已创建。"""

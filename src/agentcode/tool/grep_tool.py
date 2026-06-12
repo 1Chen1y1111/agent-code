@@ -9,14 +9,15 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
+from typing import Any
 
-from agentcode.tool import Result, _load_json_object
+from agentcode.tool import BaseTool, ExecutionMode, ToolResult, ToolUpdate, text_result
 
 MAX_MATCHES = 100
 MAX_LINE_CHARS = 1_000_000
 
 
-class GrepTool:
+class GrepTool(BaseTool):
     def name(self) -> str:
         """返回模型调用内容搜索能力时使用的工具名。"""
 
@@ -46,26 +47,27 @@ class GrepTool:
             "required": ["pattern"],
         }
 
-    async def execute(self, args: str) -> Result:
+    def execution_mode(self) -> ExecutionMode:
+        """grep 只读取文件内容，可与其他只读工具并发执行。"""
+
+        return "parallel"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
         """搜索匹配内容，跳过不可读文件并截断过大的命中集合。"""
 
-        data, error = _load_json_object(args)
-        if error is not None:
-            return Result(error, is_error=True)
-        pattern = data.get("pattern") if data is not None else None
-        root_value = data.get("path", ".") if data is not None else "."
-        glob_value = data.get("glob") if data is not None else None
-        if not isinstance(pattern, str) or not pattern:
-            return Result("缺少必填参数: pattern", is_error=True)
-        if not isinstance(root_value, str) or not root_value:
-            return Result("参数 path 必须是字符串", is_error=True)
-        if glob_value is not None and not isinstance(glob_value, str):
-            return Result("参数 glob 必须是字符串", is_error=True)
+        pattern = args["pattern"]
+        root_value = args.get("path", ".")
+        glob_value = args.get("glob")
 
         try:
             regex = re.compile(pattern)
         except re.error as exc:
-            return Result(f"正则非法: {exc}", is_error=True)
+            return text_result(f"正则非法: {exc}", is_error=True)
 
         root = Path(root_value)
         matches: list[str] = []
@@ -82,11 +84,11 @@ class GrepTool:
                         if regex.search(line):
                             matches.append(f"{file}:{line_no}:{line.rstrip()}")
                         if len(matches) >= MAX_MATCHES:
-                            return Result("\n".join(matches) + "\n[truncated]")
+                            return text_result("\n".join(matches) + "\n[truncated]")
             except (OSError, UnicodeDecodeError):
                 continue
             await asyncio.sleep(0)
 
         if not matches:
-            return Result("无命中")
-        return Result("\n".join(matches))
+            return text_result("无命中")
+        return text_result("\n".join(matches))

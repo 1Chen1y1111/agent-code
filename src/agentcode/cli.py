@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 
 from agentcode.config import ConfigError, load
-from agentcode.tool import new_default_registry
+from agentcode.tool import create_default_registry
 from agentcode.tui import AgentCodeApp
 
 HELP = """Usage: agentcode
@@ -34,6 +34,6 @@ def main() -> None:
         print(f"配置错误：{exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    AgentCodeApp(config.providers, new_default_registry()).run(
+    AgentCodeApp(config.providers, create_default_registry()).run(
         inline=True, inline_no_clear=True
     )

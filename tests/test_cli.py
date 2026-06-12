@@ -35,7 +35,7 @@ class CliTests(unittest.TestCase):
         with (
             patch("sys.argv", ["agentcode"]),
             patch("agentcode.cli.load", return_value=config),
-            patch("agentcode.cli.new_default_registry", return_value="registry"),
+            patch("agentcode.cli.create_default_registry", return_value="registry"),
             patch("agentcode.cli.AgentCodeApp", return_value=app) as app_cls,
         ):
             main()
