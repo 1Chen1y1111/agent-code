@@ -25,6 +25,16 @@ class LsTool(BaseTool):
 
         return "列出指定目录的直接子项，目录以 / 结尾。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 ls 能力摘要。"""
+
+        return "列出目录直接子项"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 ls 工具相关的模型行为约束。"""
+
+        return ["Use ls to inspect directory structure instead of bash."]
+
     def parameters(self) -> dict[str, object]:
         """声明 ls 工具的目录路径参数 schema。"""
 

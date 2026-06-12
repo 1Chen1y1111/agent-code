@@ -95,6 +95,11 @@ class OpenAIProvider:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if stream_options.cache_retention not in (None, "none"):
+            if stream_options.session_id:
+                request["prompt_cache_key"] = stream_options.session_id
+            if stream_options.cache_retention == "long":
+                request["prompt_cache_retention"] = "24h"
         if stream_options.temperature is not None:
             request["temperature"] = stream_options.temperature
         if stream_options.max_tokens is not None:
@@ -381,13 +386,28 @@ def _extract_usage(chunk: Any) -> Usage | None:
         return None
     input_tokens = _int_attr(usage, "prompt_tokens", "input_tokens")
     output_tokens = _int_attr(usage, "completion_tokens", "output_tokens")
-    total_tokens = _int_attr(usage, "total_tokens") or input_tokens + output_tokens
-    prompt_details = getattr(usage, "prompt_tokens_details", None)
-    cache_read = _int_attr(prompt_details, "cached_tokens")
+    prompt_details = getattr(usage, "prompt_tokens_details", None) or getattr(
+        usage, "input_tokens_details", None
+    )
+    cache_read = _int_attr(
+        prompt_details,
+        "cached_tokens",
+    ) or _int_attr(usage, "prompt_cache_hit_tokens")
+    cache_write = _int_attr(
+        prompt_details,
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+    )
+    uncached_input = max(0, input_tokens - cache_read - cache_write)
+    total_tokens = (
+        _int_attr(usage, "total_tokens")
+        or uncached_input + output_tokens + cache_read + cache_write
+    )
     return Usage(
-        input=input_tokens,
+        input=uncached_input,
         output=output_tokens,
         cache_read=cache_read,
+        cache_write=cache_write,
         total_tokens=total_tokens,
     )
 

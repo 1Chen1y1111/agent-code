@@ -39,6 +39,25 @@ async def test_registry_exports_default_tools_in_order() -> None:
     assert "未知工具" in content_text(result.content)
 
 
+def test_registry_exports_tool_prompt_metadata_separately() -> None:
+    registry = create_default_registry()
+
+    definitions = {definition.name: definition for definition in registry.definitions()}
+
+    assert definitions["read"].description == "读取指定文本文件内容，返回带行号的文本。"
+    assert definitions["read"].prompt_snippet == "读取文件内容"
+    assert "Use read to examine files instead of cat or sed." in definitions[
+        "read"
+    ].prompt_guidelines
+    assert definitions["edit"].description == (
+        "在文本文件中用 new_string 替换唯一匹配的 old_string。"
+    )
+    assert definitions["edit"].prompt_snippet == "用精确文本替换修改文件"
+    assert "Use edit for precise changes to existing files." in definitions[
+        "edit"
+    ].prompt_guidelines
+
+
 def test_registry_rejects_duplicate_tool_names() -> None:
     registry = Registry()
     tool = ReadFileTool()

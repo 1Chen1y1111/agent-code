@@ -41,7 +41,15 @@ class Tool(Protocol):
         ...
 
     def description(self) -> str:
-        """返回暴露给模型的工具用途说明。"""
+        """返回 provider tools schema 中的工具调用说明。"""
+        ...
+
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 工具列表中的一句话能力摘要。"""
+        ...
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 system prompt 中和此工具相关的行为约束。"""
         ...
 
     def parameters(self) -> dict[str, Any]:
@@ -84,6 +92,16 @@ class BaseTool:
 
         return args
 
+    def prompt_snippet(self) -> str:
+        """默认不把工具写入 system prompt 的工具摘要列表。"""
+
+        return ""
+
+    def prompt_guidelines(self) -> list[str]:
+        """默认不为工具追加 system prompt 行为约束。"""
+
+        return []
+
 
 class Registry:
     """集中登记、导出和执行工具。"""
@@ -116,6 +134,8 @@ class Registry:
                 name=tool.name(),
                 description=tool.description(),
                 parameters=tool.parameters(),
+                prompt_snippet=tool.prompt_snippet(),
+                prompt_guidelines=tuple(tool.prompt_guidelines()),
             )
             for tool in (self._tools[name] for name in self._order)
         ]

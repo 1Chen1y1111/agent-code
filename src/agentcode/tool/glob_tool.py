@@ -26,6 +26,16 @@ class GlobTool(BaseTool):
 
         return "按 glob 模式查找匹配的文件路径。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 find 能力摘要。"""
+
+        return "按 glob 查找文件路径"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 find 工具相关的模型行为约束。"""
+
+        return ["Use find to locate files by path pattern instead of bash."]
+
     def parameters(self) -> dict[str, object]:
         """声明 find 工具的匹配模式和可选根目录 schema。"""
 

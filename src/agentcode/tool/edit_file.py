@@ -23,6 +23,19 @@ class EditFileTool(BaseTool):
 
         return "在文本文件中用 new_string 替换唯一匹配的 old_string。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 edit 能力摘要。"""
+
+        return "用精确文本替换修改文件"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 edit 工具相关的模型行为约束。"""
+
+        return [
+            "Use edit for precise changes to existing files.",
+            "Read the file first, then keep old_string as small as possible while still unique.",
+        ]
+
     def parameters(self) -> dict[str, object]:
         """声明 edit 工具的路径、旧文本和新文本参数 schema。"""
 

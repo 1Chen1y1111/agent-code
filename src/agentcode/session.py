@@ -11,9 +11,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
-from agentcode.agent import Agent, AgentEvent, EventType, StopReason
+from agentcode.agent import Agent, AgentEvent, AgentRunOptions, EventType, StopReason
 from agentcode.conversation import Conversation
 from agentcode.llm import Message, Provider, Usage, UserMessage
+from agentcode.prompt import PromptBuildOptions
 from agentcode.tool import Registry
 
 SessionEventType = Literal["agent_start"] | EventType
@@ -59,13 +60,19 @@ class SessionEvent:
 
 
 class AgentSession:
-    """进程内会话，持有 Provider、工具注册中心和线性对话历史。"""
+    """进程内会话，持有 Provider、工具注册中心、提示选项和线性对话历史。"""
 
-    def __init__(self, provider: Provider, registry: Registry) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        registry: Registry,
+        prompt_options: PromptBuildOptions | None = None,
+    ) -> None:
         """创建绑定 provider 和工具集的进程内会话。"""
 
         self.provider = provider
         self._registry = registry
+        self._prompt_options = prompt_options or PromptBuildOptions()
         self._conversation = Conversation()
 
     def messages(self) -> list[Message]:
@@ -84,5 +91,6 @@ class AgentSession:
         yield SessionEvent(type="message_end", message=user_message)
 
         agent = Agent(self.provider, self._registry)
-        async for event in agent.run(self._conversation):
+        run_options = AgentRunOptions(prompt_options=self._prompt_options)
+        async for event in agent.run(self._conversation, run_options):
             yield SessionEvent.from_agent(event)

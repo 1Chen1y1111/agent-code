@@ -23,6 +23,19 @@ class WriteFileTool(BaseTool):
 
         return "创建或覆盖写入指定文本文件，父目录不存在时自动创建。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 write 能力摘要。"""
+
+        return "创建或完整覆盖文件"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 write 工具相关的模型行为约束。"""
+
+        return [
+            "Use write only for new files or complete rewrites.",
+            "Before overwriting an existing file, read it first unless the user explicitly provided the full desired content.",
+        ]
+
     def parameters(self) -> dict[str, object]:
         """声明 write 工具的目标路径和完整内容参数 schema。"""
 

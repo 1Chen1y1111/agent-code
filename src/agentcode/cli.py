@@ -6,9 +6,11 @@ AgentCode 命令行入口。
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 from agentcode.config import ConfigError, load
+from agentcode.resource_loader import load_prompt_resources
 from agentcode.tool import create_default_registry
 from agentcode.tui import AgentCodeApp
 
@@ -34,6 +36,12 @@ def main() -> None:
         print(f"配置错误：{exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    AgentCodeApp(config.providers, create_default_registry()).run(
-        inline=True, inline_no_clear=True
+    prompt_resources = load_prompt_resources(Path.cwd())
+    AgentCodeApp(
+        config.providers,
+        create_default_registry(),
+        prompt_resources.prompt_options,
+    ).run(
+        inline=True,
+        inline_no_clear=True,
     )

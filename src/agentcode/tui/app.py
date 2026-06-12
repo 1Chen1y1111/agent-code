@@ -23,7 +23,7 @@ from textual.widgets.option_list import Option
 from agentcode import __version__
 from agentcode.config import ProviderConfig
 from agentcode.llm import ROLE_USER, Provider, create_provider, message_text
-from agentcode.prompt import render_banner
+from agentcode.prompt import PromptBuildOptions, render_banner
 from agentcode.session import AgentSession
 from agentcode.tool import Registry, create_default_registry
 from agentcode.tui.input import ChatInput
@@ -165,7 +165,10 @@ class AgentCodeApp(App[None]):
     ]
 
     def __init__(
-        self, providers: list[ProviderConfig], registry: Registry | None = None
+        self,
+        providers: list[ProviderConfig],
+        registry: Registry | None = None,
+        prompt_options: PromptBuildOptions | None = None,
     ) -> None:
         """初始化 TUI 状态，并注入 provider 配置和工具注册中心。"""
 
@@ -173,6 +176,7 @@ class AgentCodeApp(App[None]):
         install_scrollbar_renderer()
         self.providers = providers
         self._tool_registry = registry or create_default_registry()
+        self._prompt_options = prompt_options or PromptBuildOptions()
         self.provider: Provider | None = None
         self.agent_session: AgentSession | None = None
         self._agent_session_provider: Provider | None = None
@@ -487,7 +491,7 @@ class AgentCodeApp(App[None]):
     async def _show_working(self) -> None:
         """显示或刷新聊天流末尾的 Working 临时消息。"""
 
-        renderable = working_text(WORKING_FRAMES[self._working_frame_index])
+        renderable = self._working_renderable()
         if self._working_widget is None:
             # working 是聊天流的一条临时消息，而不是固定在输入框上方的状态栏；
             # 新消息追加时会先移除再挂回末尾，从而保持自然的滚动语义。
@@ -505,10 +509,29 @@ class AgentCodeApp(App[None]):
 
         if self._working_widget is None:
             return
-        self._working_widget.update_renderable(
-            working_text(WORKING_FRAMES[self._working_frame_index])
-        )
+        self._working_widget.update_renderable(self._working_renderable())
         self._scroll_chat_to_end()
+
+    def _working_renderable(self) -> RenderableType:
+        """按当前输出状态生成 Working；已有模型输出后才补前导空行。"""
+
+        return working_text(
+            WORKING_FRAMES[self._working_frame_index],
+            leading_blank=self._working_needs_leading_blank(),
+        )
+
+    def _working_needs_leading_blank(self) -> bool:
+        """判断 Working 是否需要和已有助手输出隔开一行。"""
+
+        return (
+            (
+                bool(self.cur_reply)
+                or bool(self.cur_thinking)
+                or self._active_assistant is not None
+            )
+            and self._active_tool is None
+            and not self._active_tool_name
+        )
 
     async def _hide_working(self) -> None:
         """隐藏 Working 临时消息并保持滚动到底部。"""
@@ -560,7 +583,11 @@ class AgentCodeApp(App[None]):
             self.agent_session is None
             or self._agent_session_provider is not self.provider
         ):
-            self.agent_session = AgentSession(self.provider, self._tool_registry)
+            self.agent_session = AgentSession(
+                self.provider,
+                self._tool_registry,
+                self._prompt_options,
+            )
             self._agent_session_provider = self.provider
         return self.agent_session
 

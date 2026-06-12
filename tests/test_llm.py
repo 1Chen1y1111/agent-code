@@ -102,6 +102,36 @@ class AnthropicProviderTests(unittest.TestCase):
         self.assertEqual(request["temperature"], 0.2)
         self.assertEqual(request["max_tokens"], 123)
 
+    def test_stream_options_add_anthropic_cache_control(self) -> None:
+        fake_client = FakeAnthropicClient([])
+        provider = AnthropicProvider(_cfg("anthropic"), client=fake_client)
+
+        chunks = asyncio.run(
+            _collect(
+                provider.stream(
+                    _context("hi", [_tool_definition()]),
+                    StreamOptions(cache_retention="short"),
+                )
+            )
+        )
+
+        self.assertEqual(chunks[-1].type, "done")
+        request = fake_client.messages.requests[0]
+        self.assertEqual(
+            request["system"],
+            [
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        )
+        self.assertEqual(
+            request["tools"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+
     def test_stream_error_includes_diagnostics(self) -> None:
         provider = AnthropicProvider(
             _cfg("anthropic"),
@@ -304,6 +334,53 @@ class OpenAIProviderTests(unittest.TestCase):
         request = fake_client.chat.completions.requests[0]
         self.assertEqual(request["temperature"], 0.2)
         self.assertEqual(request["max_tokens"], 123)
+
+    def test_stream_options_add_openai_cache_key(self) -> None:
+        fake_client = FakeOpenAIClient([])
+        provider = OpenAIProvider(_cfg("openai"), client=fake_client)
+
+        chunks = asyncio.run(
+            _collect(
+                provider.stream(
+                    _context("hi"),
+                    StreamOptions(cache_retention="long", session_id="session-1"),
+                )
+            )
+        )
+
+        self.assertEqual(chunks[-1].type, "done")
+        request = fake_client.chat.completions.requests[0]
+        self.assertEqual(request["prompt_cache_key"], "session-1")
+        self.assertEqual(request["prompt_cache_retention"], "24h")
+
+    def test_stream_extracts_openai_cache_usage(self) -> None:
+        fake_client = FakeOpenAIClient(
+            [
+                SimpleNamespace(
+                    choices=[],
+                    usage=SimpleNamespace(
+                        prompt_tokens=100,
+                        completion_tokens=7,
+                        total_tokens=107,
+                        prompt_tokens_details=SimpleNamespace(
+                            cached_tokens=40,
+                            cache_write_tokens=10,
+                        ),
+                    ),
+                )
+            ]
+        )
+        provider = OpenAIProvider(_cfg("openai"), client=fake_client)
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(chunks[-1].type, "done")
+        usage = chunks[-1].message.usage
+        self.assertEqual(usage.input, 50)
+        self.assertEqual(usage.output, 7)
+        self.assertEqual(usage.cache_read, 40)
+        self.assertEqual(usage.cache_write, 10)
+        self.assertEqual(usage.total_tokens, 107)
 
     def test_stream_error_includes_diagnostics(self) -> None:
         provider = OpenAIProvider(

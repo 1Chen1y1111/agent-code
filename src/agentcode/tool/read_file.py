@@ -33,6 +33,19 @@ class ReadFileTool(BaseTool):
 
         return "读取指定文本文件内容，返回带行号的文本。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 read 能力摘要。"""
+
+        return "读取文件内容"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 read 工具相关的模型行为约束。"""
+
+        return [
+            "Use read to examine files instead of cat or sed.",
+            "Before editing an existing file, read the relevant content first.",
+        ]
+
     def parameters(self) -> dict[str, object]:
         """声明 read 工具需要的文件路径参数 schema。"""
 

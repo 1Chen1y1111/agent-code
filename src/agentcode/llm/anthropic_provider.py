@@ -87,16 +87,20 @@ class AnthropicProvider:
         """调用 Anthropic messages stream，并转换为统一 assistant 事件。"""
 
         stream_options = options or StreamOptions()
+        cache_control = _cache_control(stream_options.cache_retention)
         request: dict[str, Any] = {
             "model": self._cfg.model,
             "max_tokens": stream_options.max_tokens or DEFAULT_MAX_TOKENS,
-            "system": context.system_prompt or SYSTEM_PROMPT,
+            "system": _to_anthropic_system(
+                context.system_prompt or SYSTEM_PROMPT,
+                cache_control,
+            ),
             "messages": _to_anthropic_messages(context.messages),
         }
         if stream_options.temperature is not None:
             request["temperature"] = stream_options.temperature
         if context.tools:
-            request["tools"] = _to_anthropic_tools(context.tools)
+            request["tools"] = _to_anthropic_tools(context.tools, cache_control)
         if self._cfg.thinking and not _has_tool_history(context.messages):
             # Anthropic thinking replay 需要签名；当前协议已能保存 thinking block，
             # 但没有实现签名回放，所以已有工具历史时仍禁用 thinking。
@@ -349,17 +353,50 @@ def _to_anthropic_assistant_content(
     return blocks
 
 
-def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-    """把统一工具定义转换成 Anthropic tool_use 可识别的格式。"""
+def _to_anthropic_system(
+    system_prompt: str,
+    cache_control: dict[str, str] | None,
+) -> str | list[dict[str, Any]]:
+    """转换 system prompt；只有显式缓存请求才使用 block 形态。"""
 
+    if cache_control is None:
+        return system_prompt
     return [
         {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": cache_control,
+        }
+    ]
+
+
+def _to_anthropic_tools(
+    tools: list[ToolDefinition],
+    cache_control: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """把统一工具定义转换成 Anthropic tool_use 可识别的格式。"""
+
+    converted: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        item = {
             "name": tool.name,
             "description": tool.description,
             "input_schema": tool.parameters,
         }
-        for tool in tools
-    ]
+        if cache_control is not None and index == len(tools) - 1:
+            item["cache_control"] = cache_control
+        converted.append(item)
+    return converted
+
+
+def _cache_control(cache_retention: str | None) -> dict[str, str] | None:
+    """把统一 cache_retention 映射为 Anthropic ephemeral cache 控制。"""
+
+    if cache_retention in (None, "none"):
+        return None
+    if cache_retention == "long":
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
 
 
 def _new_client(cfg: ProviderConfig) -> AsyncAnthropic:

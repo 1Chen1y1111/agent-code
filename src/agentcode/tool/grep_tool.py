@@ -28,6 +28,16 @@ class GrepTool(BaseTool):
 
         return "用 Python 正则搜索文件内容，返回 file:line:content 命中列表。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 grep 能力摘要。"""
+
+        return "搜索文件内容"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 grep 工具相关的模型行为约束。"""
+
+        return ["Use grep to search file contents instead of shelling out to rg/grep."]
+
     def parameters(self) -> dict[str, object]:
         """声明 grep 工具的正则、根目录和文件过滤参数 schema。"""
 

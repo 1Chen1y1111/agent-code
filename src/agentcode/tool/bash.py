@@ -30,6 +30,16 @@ class BashTool(BaseTool):
 
         return "在当前工作目录执行 shell 命令，返回 stdout、stderr 和退出码。"
 
+    def prompt_snippet(self) -> str:
+        """返回 system prompt 中的 bash 能力摘要。"""
+
+        return "执行 shell 命令"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回 bash 工具相关的模型行为约束。"""
+
+        return ["Prefer dedicated file tools over bash when they fit the task."]
+
     def parameters(self) -> dict[str, object]:
         """声明 bash 工具接受的 JSON 参数 schema。"""
 

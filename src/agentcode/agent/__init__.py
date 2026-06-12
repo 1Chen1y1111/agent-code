@@ -8,9 +8,10 @@ TUI、配置加载、会话持久化或用户输入命令。
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field, replace
 import json
+from pathlib import Path
 from typing import Literal
 
 from agentcode.conversation import Conversation
@@ -24,10 +25,20 @@ from agentcode.llm import (
     TextDeltaEvent,
     ThinkingDeltaEvent,
     ToolCall,
+    ToolDefinition,
     ToolResultMessage,
     Usage,
+    UserMessage,
+    StreamOptions,
     assistant_tool_calls,
     text_content,
+)
+from agentcode.prompt import (
+    DEFAULT_TOOL_SNIPPETS,
+    PromptBuildOptions,
+    SupplementalInstruction,
+    build_system_prompt,
+    format_supplemental_instruction,
 )
 from agentcode.tool import (
     DEFAULT_TIMEOUT,
@@ -74,6 +85,10 @@ class AgentRunOptions:
 
     max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_unknown_tools: int = DEFAULT_MAX_UNKNOWN_TOOLS
+    prompt_options: PromptBuildOptions = field(default_factory=PromptBuildOptions)
+    supplemental_instructions: tuple[SupplementalInstruction, ...] = ()
+    cache_retention: Literal["none", "short", "long"] | None = "short"
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +159,20 @@ class Agent:
                 )
                 assistant_message: AssistantMessage | None = None
                 message_started = False
-                context = Context(
-                    messages=conv.messages(),
-                    tools=self._registry.definitions(),
+                tools = self._registry.definitions()
+                context = _build_context(
+                    conv,
+                    tools,
+                    run_options.prompt_options,
+                    run_options.supplemental_instructions,
                 )
-                async for stream_event in self._provider.stream(context):
+                stream_options = StreamOptions(
+                    cache_retention=run_options.cache_retention,
+                    session_id=run_options.session_id,
+                )
+                async for stream_event in self._provider.stream(
+                    context, stream_options
+                ):
                     if stream_event.type == "start":
                         message_started = True
                         yield AgentEvent(
@@ -394,6 +418,83 @@ def _tool_is_available(registry: Registry, name: str) -> bool:
     """判断模型请求的工具是否已注册。"""
 
     return registry.get(name) is not None
+
+
+def _build_context(
+    conv: Conversation,
+    tools: list[ToolDefinition],
+    prompt_options: PromptBuildOptions,
+    supplemental_instructions: tuple[SupplementalInstruction, ...],
+) -> Context:
+    """构建单次请求上下文，临时补充消息不写回 Conversation。"""
+
+    resolved_options = _resolve_prompt_options(prompt_options, tools)
+    transient_messages = _transient_prompt_messages(supplemental_instructions)
+    return Context(
+        system_prompt=build_system_prompt(resolved_options),
+        messages=[*transient_messages, *conv.messages()],
+        tools=tools,
+    )
+
+
+def _resolve_prompt_options(
+    options: PromptBuildOptions,
+    tools: list[ToolDefinition],
+) -> PromptBuildOptions:
+    """把本轮工具清单和 cwd 补入提示构建参数。"""
+
+    selected_tools = options.selected_tools or tuple(tool.name for tool in tools)
+    tool_snippets = {
+        **DEFAULT_TOOL_SNIPPETS,
+        **{
+            tool.name: tool.prompt_snippet
+            for tool in tools
+            if tool.prompt_snippet
+        },
+        **dict(options.tool_snippets),
+    }
+    prompt_guidelines = _unique_prompt_guidelines(
+        [
+            guideline
+            for tool in tools
+            for guideline in tool.prompt_guidelines
+        ],
+        options.prompt_guidelines,
+    )
+    return replace(
+        options,
+        selected_tools=selected_tools,
+        tool_snippets=tool_snippets,
+        prompt_guidelines=prompt_guidelines,
+        cwd=options.cwd or str(Path.cwd()),
+    )
+
+
+def _unique_prompt_guidelines(
+    tool_guidelines: list[str],
+    option_guidelines: Sequence[str],
+) -> tuple[str, ...]:
+    """按工具顺序收集 prompt guideline，并保留调用方追加项。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for guideline in [*tool_guidelines, *option_guidelines]:
+        normalized = guideline.strip()
+        if normalized and normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return tuple(result)
+
+
+def _transient_prompt_messages(
+    supplemental_instructions: tuple[SupplementalInstruction, ...],
+) -> list[UserMessage]:
+    """把运行时补充指令转换成仅本轮可见的 user 消息。"""
+
+    return [
+        UserMessage(content=format_supplemental_instruction(instruction))
+        for instruction in supplemental_instructions
+    ]
 
 
 def _append_stop_message(

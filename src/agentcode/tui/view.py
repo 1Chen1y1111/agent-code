@@ -56,10 +56,11 @@ def _thinking_parts(thinking: str, hide_thinking: bool) -> list[RenderableType]:
     return [Text(f"{thinking.strip()}\n", style="dim italic")]
 
 
-def working_text(frame: str) -> Text:
+def working_text(frame: str, leading_blank: bool = False) -> Text:
     """渲染聊天流末尾的工作中 spinner 文本。"""
 
-    return Text.assemble((f" \n{frame} ", "bold cyan"), ("Working...", "dim"))
+    prefix = f"\n{frame} " if leading_blank else f"{frame} "
+    return Text.assemble((prefix, "bold cyan"), ("Working...", "dim"))
 
 
 def error_block(error: Exception) -> Text:

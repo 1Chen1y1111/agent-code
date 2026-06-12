@@ -21,6 +21,7 @@ from agentcode.llm import (
     DoneEvent,
     DoneStopReason,
     StartEvent,
+    StreamOptions,
     TextContent,
     TextDeltaEvent,
     ThinkingContent,
@@ -28,6 +29,11 @@ from agentcode.llm import (
     ToolCall,
     Usage,
     message_text,
+)
+from agentcode.prompt import (
+    PromptBuildOptions,
+    PromptContextFile,
+    SupplementalInstruction,
 )
 from agentcode.session import AgentSession
 from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
@@ -307,6 +313,84 @@ async def test_agent_session_emits_user_events_and_keeps_history() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_agent_session_passes_prompt_context_files_to_system_prompt() -> None:
+    provider = FakeProvider([_assistant_events(text="你好")])
+    session = AgentSession(
+        provider,
+        RecordingRegistry(),
+        PromptBuildOptions(
+            context_files=(
+                PromptContextFile(path="/tmp/AGENTS.md", content="始终中文回答"),
+            )
+        ),
+    )
+
+    await _collect(session.prompt("hi"))
+
+    system_prompt = provider.requests[0].system_prompt or ""
+    assert '<project_instructions path="/tmp/AGENTS.md">' in system_prompt
+    assert "始终中文回答" in system_prompt
+    assert "Current date:" in system_prompt
+    assert "Current working directory:" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_supplemental_context_without_persisting_it() -> None:
+    conv = Conversation()
+    conv.add_user("hi")
+    provider = FakeProvider([_assistant_events(text="ok")])
+    registry = RecordingRegistry()
+
+    events = [
+        event
+        async for event in Agent(provider, registry).run(
+            conv,
+            AgentRunOptions(
+                supplemental_instructions=(
+                    SupplementalInstruction(source="test", content="Remember X"),
+                ),
+                session_id="session-1",
+            ),
+        )
+    ]
+
+    assert events[-1].stop_reason == "completed"
+    request = provider.requests[0]
+    assert request.system_prompt is not None
+    assert "Available tools:" in request.system_prompt
+    assert "Current date:" in request.system_prompt
+    assert "Current working directory:" in request.system_prompt
+    assert len(request.messages) == 2
+    assert request.messages[0].role == "user"
+    assert "source=\"test\"" in str(request.messages[0].content)
+    assert "Remember X" in str(request.messages[0].content)
+    assert message_text(request.messages[1]) == "hi"
+    assert [(message.role, message_text(message)) for message in conv.messages()] == [
+        ("user", "hi"),
+        ("assistant", "ok"),
+    ]
+    assert provider.stream_options[0] is not None
+    assert provider.stream_options[0].cache_retention == "short"
+    assert provider.stream_options[0].session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_agent_system_prompt_uses_tool_prompt_metadata() -> None:
+    conv = Conversation()
+    conv.add_user("hi")
+    provider = FakeProvider([_assistant_events(text="ok")])
+    registry = RecordingRegistry()
+    registry.register(PromptMetadataTool())
+
+    await _collect(Agent(provider, registry).run(conv))
+
+    system_prompt = provider.requests[0].system_prompt or ""
+    assert "- meta: Short prompt snippet" in system_prompt
+    assert "Use meta carefully." in system_prompt
+    assert "Provider-only description" not in system_prompt
+
+
 async def _collect(stream: AsyncIterator[object]) -> list[object]:
     events: list[object] = []
     async for event in stream:
@@ -321,11 +405,15 @@ class FakeProvider:
         self.model = "fake-model"
         self._scripts = scripts
         self.requests: list[Context] = []
+        self.stream_options: list[StreamOptions | None] = []
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: StreamOptions | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         self.requests.append(context)
+        self.stream_options.append(options)
         script = self._scripts.pop(0)
         for event in script:
             yield event
@@ -387,6 +475,26 @@ class ProbeTool(FakeTool):
         on_update: ToolUpdate | None = None,
     ) -> ToolResult:
         return await self._probe.run(self.name())
+
+
+class PromptMetadataTool(FakeTool):
+    def __init__(self) -> None:
+        super().__init__("meta", "ok", "parallel")
+
+    def description(self) -> str:
+        """返回只应进入 provider tools 的说明。"""
+
+        return "Provider-only description"
+
+    def prompt_snippet(self) -> str:
+        """返回只应进入 system prompt 工具列表的摘要。"""
+
+        return "Short prompt snippet"
+
+    def prompt_guidelines(self) -> list[str]:
+        """返回只应进入 system prompt guidelines 的行为约束。"""
+
+        return ["Use meta carefully."]
 
 
 class UpdatingTerminatingTool(FakeTool):

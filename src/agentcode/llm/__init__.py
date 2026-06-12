@@ -130,6 +130,8 @@ class ToolDefinition:
     name: str
     description: str
     parameters: dict[str, Any]
+    prompt_snippet: str = ""
+    prompt_guidelines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -160,7 +160,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_working_text_uses_spinner_and_message(self) -> None:
-        self.assertEqual(working_text("⠋").plain, " \n⠋ Working...")
+        self.assertEqual(working_text("⠋").plain, "⠋ Working...")
+        self.assertEqual(working_text("⠋", leading_blank=True).plain, "\n⠋ Working...")
 
     def test_final_elapsed_seconds_never_shows_zero(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -180,6 +181,60 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             ]
 
             self.assertEqual(ids, ["chat", "input", "statusbar"])
+
+    async def test_working_indicator_has_no_gap_before_first_token(self) -> None:
+        app = AgentCodeApp([_provider("Only", "openai")])
+
+        async with app.run_test() as pilot:
+            provider = DelayedFirstTokenProvider("最终答案")
+            app.provider = provider
+            input_box = app.query_one("#input", ChatInput)
+            input_box.focus()
+
+            await pilot.press("h", "i", "enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if _working_widgets(app) and "● hi" in _chat_text(app):
+                    break
+            else:
+                self.fail("working indicator did not render before first token")
+
+            self.assertFalse(_working_text(app).startswith("\n"))
+
+            provider.resume()
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not _working_widgets(app) and "最终答案" in _chat_text(app):
+                    break
+            else:
+                self.fail("assistant answer did not finish")
+
+    async def test_working_indicator_adds_gap_after_output(self) -> None:
+        app = AgentCodeApp([_provider("Only", "openai")])
+
+        async with app.run_test() as pilot:
+            provider = ControlledThinkingProvider("先分析边界", "最终答案")
+            app.provider = provider
+            input_box = app.query_one("#input", ChatInput)
+            input_box.focus()
+
+            await pilot.press("h", "i", "enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if _working_widgets(app) and "先分析边界" in _chat_text(app):
+                    break
+            else:
+                self.fail("assistant output did not render before working check")
+
+            self.assertTrue(_working_text(app).startswith("\n"))
+
+            provider.resume()
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not _working_widgets(app) and "最终答案" in _chat_text(app):
+                    break
+            else:
+                self.fail("assistant answer did not finish")
 
     async def test_enter_submits_and_clears_input(self) -> None:
         app = AgentCodeApp([_provider("Only", "openai")])
@@ -929,7 +984,9 @@ class FakeProvider:
         self._reply = reply
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: object | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         for event in _assistant_events(text=self._reply):
             yield event
@@ -944,7 +1001,9 @@ class ScriptedProvider:
         self.requests: list[Context] = []
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: object | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         self.requests.append(context)
         script = self._scripts.pop(0)
@@ -964,12 +1023,37 @@ class ControlledTextProvider:
         self._resume.set()
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: object | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         message = _assistant_message(self._reply)
         yield StartEvent(partial=AssistantMessage())
         yield TextDeltaEvent(content_index=0, delta=self._reply, partial=message)
         await self._resume.wait()
+        yield DoneEvent(reason="stop", message=message)
+
+
+class DelayedFirstTokenProvider:
+    def __init__(self, reply: str) -> None:
+        self.api = "fake"
+        self.name = "Fake"
+        self.model = "fake-model"
+        self._reply = reply
+        self._resume = asyncio.Event()
+
+    def resume(self) -> None:
+        self._resume.set()
+
+    async def stream(
+        self,
+        context: Context,
+        options: object | None = None,
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        message = _assistant_message(self._reply)
+        yield StartEvent(partial=AssistantMessage())
+        await self._resume.wait()
+        yield TextDeltaEvent(content_index=0, delta=self._reply, partial=message)
         yield DoneEvent(reason="stop", message=message)
 
 
@@ -983,7 +1067,9 @@ class SlowThinkingProvider:
         self._delay = delay
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: object | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         yield StartEvent(partial=AssistantMessage())
         yield ThinkingDeltaEvent(
@@ -1018,7 +1104,9 @@ class ControlledThinkingProvider:
         self._resume.set()
 
     async def stream(
-        self, context: Context
+        self,
+        context: Context,
+        options: object | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         yield StartEvent(partial=AssistantMessage())
         yield ThinkingDeltaEvent(
