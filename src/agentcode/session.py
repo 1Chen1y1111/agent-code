@@ -7,14 +7,27 @@ AgentCode 的进程内会话封装。
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Literal
 
-from agentcode.agent import Agent, AgentEvent, AgentRunOptions, EventType, StopReason
+from agentcode.agent import (
+    Agent,
+    AgentEvent,
+    AgentRunOptions,
+    EventType,
+    PermissionApprover,
+    StopReason,
+)
 from agentcode.conversation import Conversation
 from agentcode.llm import Message, Provider, Usage, UserMessage
-from agentcode.prompt import PromptBuildOptions
+from agentcode.permission import (
+    PLAN_REMINDER,
+    PLAN_TOOL_NAMES,
+    PermissionMode,
+    PermissionPolicy,
+)
+from agentcode.prompt import PromptBuildOptions, SupplementalInstruction
 from agentcode.tool import Registry
 
 SessionEventType = Literal["agent_start"] | EventType
@@ -67,6 +80,10 @@ class AgentSession:
         provider: Provider,
         registry: Registry,
         prompt_options: PromptBuildOptions | None = None,
+        *,
+        permission_policy: PermissionPolicy | None = None,
+        permission_mode: Callable[[], PermissionMode] | None = None,
+        permission_approver: PermissionApprover | None = None,
     ) -> None:
         """创建绑定 provider 和工具集的进程内会话。"""
 
@@ -74,6 +91,9 @@ class AgentSession:
         self._registry = registry
         self._prompt_options = prompt_options or PromptBuildOptions()
         self._conversation = Conversation()
+        self._permission_policy = permission_policy
+        self._permission_mode = permission_mode or (lambda: "default")
+        self._permission_approver = permission_approver
 
     def messages(self) -> list[Message]:
         """返回当前会话历史副本，主要供测试和调试观察。"""
@@ -90,7 +110,25 @@ class AgentSession:
         yield SessionEvent(type="message_start", message=user_message)
         yield SessionEvent(type="message_end", message=user_message)
 
+        mode = self._permission_mode()
         agent = Agent(self.provider, self._registry)
-        run_options = AgentRunOptions(prompt_options=self._prompt_options)
+        run_options = AgentRunOptions(
+            prompt_options=self._prompt_options,
+            supplemental_instructions=_mode_supplemental_instructions(mode),
+            permission_policy=self._permission_policy,
+            permission_mode=mode,
+            permission_approver=self._permission_approver,
+            visible_tool_names=PLAN_TOOL_NAMES if mode == "plan" else None,
+        )
         async for event in agent.run(self._conversation, run_options):
             yield SessionEvent.from_agent(event)
+
+
+def _mode_supplemental_instructions(
+    mode: PermissionMode,
+) -> tuple[SupplementalInstruction, ...]:
+    """根据当前权限模式生成只在本轮生效的补充指令。"""
+
+    if mode != "plan":
+        return ()
+    return (SupplementalInstruction(source="permission_mode", content=PLAN_REMINDER),)

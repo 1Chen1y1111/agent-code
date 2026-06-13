@@ -106,6 +106,9 @@ class OpenAIProvider:
             request["max_tokens"] = stream_options.max_tokens
         if context.tools:
             request["tools"] = _to_openai_tools(context.tools)
+        thinking_request = _thinking_request(self._cfg)
+        if thinking_request is not None:
+            request["extra_body"] = {"thinking": thinking_request}
 
         content: list[AssistantContent] = []
         text = ""
@@ -133,7 +136,9 @@ class OpenAIProvider:
                     stop_reason = chunk_stop_reason
                 _merge_tool_call_deltas(chunk, tool_calls_buf)
 
-                thinking_delta = _extract_thinking_delta(chunk)
+                thinking_delta = (
+                    _extract_thinking_delta(chunk) if self._cfg.thinking else ""
+                )
                 if thinking_delta:
                     if thinking_index is None:
                         thinking_index = len(content)
@@ -261,6 +266,21 @@ def _done_reason(reason: ModelStopReason) -> DoneStopReason:
     if reason in ("stop", "length", "toolUse"):
         return reason
     return "stop"
+
+
+def _thinking_request(cfg: ProviderConfig) -> dict[str, str] | None:
+    """生成 DeepSeek OpenAI-compatible thinking 开关参数。"""
+
+    if not _is_deepseek_endpoint(cfg):
+        return None
+    return {"type": "enabled" if cfg.thinking else "disabled"}
+
+
+def _is_deepseek_endpoint(cfg: ProviderConfig) -> bool:
+    """判断当前配置是否指向 DeepSeek 官方或 DeepSeek 命名模型。"""
+
+    base_url = (cfg.base_url or "").lower()
+    return "deepseek" in base_url or cfg.model.lower().startswith("deepseek-")
 
 
 def _to_openai_messages(message: Message) -> list[dict[str, Any]]:

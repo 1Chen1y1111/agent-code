@@ -10,10 +10,12 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 import time
-from typing import Protocol
+from typing import Protocol, cast
 
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.status import Status
@@ -21,11 +23,18 @@ from rich.status import Status
 from agentcode import __version__
 from agentcode.config import ProviderConfig
 from agentcode.llm import Provider, create_provider, message_text
+from agentcode.permission import (
+    PermissionApproval,
+    PermissionPolicy,
+    PermissionRequest,
+    next_permission_mode,
+)
 from agentcode.prompt import PromptBuildOptions, render_banner
 from agentcode.session import AgentSession, SessionEvent
 from agentcode.tool import Registry, create_default_registry
 from agentcode.terminal.view import (
     assistant_markdown,
+    assistant_text_delta,
     elapsed_block,
     error_block,
     provider_option,
@@ -37,6 +46,9 @@ from agentcode.terminal.view import (
 )
 
 EXIT_COMMANDS = {"/exit", "/quit"}
+PLAN_COMMAND = "/plan"
+DO_COMMAND = "/do"
+DO_PROMPT = "按计划执行。"
 PROMPT_TEXT = "❯ "
 PROMPT_STYLE = Style.from_dict(
     {
@@ -66,6 +78,7 @@ class TerminalApp:
         prompt_reader: PromptReader | None = None,
         provider_factory: Callable[[ProviderConfig], Provider] = create_provider,
         clock: Callable[[], float] = time.monotonic,
+        permission_policy: PermissionPolicy | None = None,
     ) -> None:
         """保存启动依赖；真实 provider 和 session 会在用户选定后创建。"""
 
@@ -73,12 +86,18 @@ class TerminalApp:
         self._registry = registry or create_default_registry()
         self._prompt_options = prompt_options or PromptBuildOptions()
         self._console = console or Console()
-        self._prompt_reader = prompt_reader or PromptSession(
-            history=InMemoryHistory(),
-            erase_when_done=True,
+        self._prompt_reader = prompt_reader or cast(
+            PromptReader,
+            PromptSession(
+                history=InMemoryHistory(),
+                erase_when_done=True,
+            ),
         )
         self._provider_factory = provider_factory
         self._clock = clock
+        self._permission_policy = permission_policy or PermissionPolicy.load(Path.cwd())
+        self._permission_mode = self._permission_policy.default_mode()
+        self._key_bindings = self._build_key_bindings()
         self.provider: Provider | None = None
         self.agent_session: AgentSession | None = None
         self._renderer = TerminalRenderer(self._console, self._clock)
@@ -104,14 +123,18 @@ class TerminalApp:
             self.provider,
             self._registry,
             self._prompt_options,
+            permission_policy=self._permission_policy,
+            permission_mode=lambda: self._permission_mode,
+            permission_approver=self._approve_permission,
         )
 
         while True:
             try:
                 raw_text = await self._prompt_reader.prompt_async(
                     PROMPT_TEXT,
-                    bottom_toolbar=self._bottom_toolbar(),
+                    bottom_toolbar=self._bottom_toolbar,
                     style=PROMPT_STYLE,
+                    key_bindings=self._key_bindings,
                 )
             except EOFError:
                 break
@@ -123,6 +146,14 @@ class TerminalApp:
                 continue
             if message in EXIT_COMMANDS:
                 break
+            if message == PLAN_COMMAND:
+                self._permission_mode = "plan"
+                self._console.print("已进入 plan 模式。\n", style="dim")
+                continue
+            if message == DO_COMMAND:
+                self._permission_mode = "default"
+                await self._run_turn(DO_PROMPT)
+                continue
             await self._run_turn(message)
 
     async def _select_provider_config(self) -> ProviderConfig | None:
@@ -147,9 +178,9 @@ class TerminalApp:
             except KeyboardInterrupt:
                 return None
 
-            provider = self._provider_from_selection(selection)
-            if provider is not None:
-                return provider
+            selected_provider = self._provider_from_selection(selection)
+            if selected_provider is not None:
+                return selected_provider
             self._console.print("请输入有效的 provider 编号。", style="bold red")
 
     def _provider_from_selection(self, selection: str) -> ProviderConfig | None:
@@ -164,11 +195,62 @@ class TerminalApp:
         return None
 
     def _bottom_toolbar(self) -> str:
-        """生成 prompt_toolkit 底部状态栏文本，显示当前 provider 和 model。"""
+        """生成 prompt_toolkit 底部状态栏文本，显示当前权限模式和模型。"""
 
         if self.provider is None:
             return ""
-        return f"\nprovider: {self.provider.name} · model: {self.provider.model}"
+        return f"\npermission: {self._permission_mode} · model: {self.provider.model}"
+
+    def _build_key_bindings(self) -> KeyBindings:
+        """创建主输入框按键绑定，用 Shift+Tab 循环切换权限模式。"""
+
+        bindings = KeyBindings()
+
+        @bindings.add("s-tab")
+        @bindings.add(Keys.BackTab)
+        @bindings.add("escape", "[", "Z")
+        def _(event: object) -> None:
+            """处理 Shift+Tab 权限模式切换。"""
+
+            self._cycle_permission_mode()
+            app = getattr(event, "app", None)
+            if app is not None:
+                app.invalidate()
+
+        return bindings
+
+    def _cycle_permission_mode(self) -> None:
+        """把当前权限模式切换到循环序列中的下一档。"""
+
+        self._permission_mode = next_permission_mode(self._permission_mode)
+
+    async def _approve_permission(
+        self,
+        request: PermissionRequest,
+    ) -> PermissionApproval:
+        """在工具执行前向用户确认 Ask 权限请求。"""
+
+        self._renderer.stop_status()
+        self._console.print(_permission_request_block(request), end="")
+        selection = {"index": 0}
+        labels = ("允许本次", "永久允许", "拒绝本次")
+        bindings = _permission_key_bindings(selection)
+
+        def toolbar() -> str:
+            """展示当前审批菜单选项，供方向键切换时刷新。"""
+
+            return f"\n当前选择: {selection['index'] + 1}. {labels[selection['index']]}"
+
+        try:
+            raw = await self._prompt_reader.prompt_async(
+                "permission> ",
+                bottom_toolbar=toolbar,
+                style=PROMPT_STYLE,
+                key_bindings=bindings,
+            )
+        except (EOFError, KeyboardInterrupt):
+            return "cancel"
+        return _approval_from_input(raw, selection["index"])
 
     async def _run_turn(self, message: str) -> None:
         """提交一条用户消息并把 Session 事件流渲染到终端。"""
@@ -187,6 +269,93 @@ class TerminalApp:
             self._console.print(error_block(exc), end="")
         finally:
             self._renderer.stop_status()
+
+
+def _permission_request_block(request: PermissionRequest) -> str:
+    """把权限确认请求格式化为终端中的 ASCII 确认块。"""
+
+    preview = request.preview.replace("\n", "\\n")
+    reason = request.reason.replace("\n", " ")
+    return (
+        "+-- 权限确认 --------------------------------\n"
+        f"| 工具: {request.friendly_name}\n"
+        f"| 参数: {preview}\n"
+        f"| 原因: {reason}\n"
+        "|\n"
+        "| > 1. 允许本次\n"
+        "|   2. 永久允许\n"
+        "|   3. 拒绝本次\n"
+        "+-------------------------------------------\n\n"
+        "↑/↓ 选择 · Enter 确认 · 1/2/3 直选 · Esc/Ctrl+C 取消\n\n"
+    )
+
+
+def _permission_key_bindings(selection: dict[str, int]) -> KeyBindings:
+    """创建权限确认菜单的方向键和数字键绑定。"""
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    def _(event: object) -> None:
+        """向上移动权限菜单光标。"""
+
+        selection["index"] = (selection["index"] - 1) % 3
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.invalidate()
+
+    @bindings.add("down")
+    def _(event: object) -> None:
+        """向下移动权限菜单光标。"""
+
+        selection["index"] = (selection["index"] + 1) % 3
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.invalidate()
+
+    @bindings.add("enter")
+    def _(event: object) -> None:
+        """确认当前高亮的权限菜单项。"""
+
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.exit(result=str(selection["index"] + 1))
+
+    @bindings.add("1")
+    @bindings.add("2")
+    @bindings.add("3")
+    def _(event: object) -> None:
+        """用数字键直接选择权限菜单项。"""
+
+        app = getattr(event, "app", None)
+        key_sequence = getattr(event, "key_sequence", ())
+        if app is not None and key_sequence:
+            app.exit(result=str(key_sequence[0].key))
+
+    @bindings.add("escape")
+    def _(event: object) -> None:
+        """取消权限确认，并让 Agent 停止当前轮。"""
+
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.exit(result="cancel")
+
+    return bindings
+
+
+def _approval_from_input(raw: str, selected_index: int) -> PermissionApproval:
+    """把 prompt 输入或菜单默认选项转换为权限审批结果。"""
+
+    value = raw.strip()
+    if not value:
+        value = str(selected_index + 1)
+    if value == "cancel":
+        return "cancel"
+    if value == "2":
+        return "allow_always"
+    if value == "3":
+        return "deny_once"
+    return "allow_once"
 
 
 class TerminalRenderer:
@@ -274,7 +443,7 @@ class TerminalRenderer:
             self._assistant_text_chunks.clear()
 
     def _handle_message_update(self, event: SessionEvent) -> None:
-        """实时追加 thinking，并缓存正文等待 Markdown 完整渲染。"""
+        """实时追加 thinking 和正文增量，避免非思考模式看起来无输出。"""
 
         if event.thinking:
             self._stop_status_for_visible_output()
@@ -282,7 +451,11 @@ class TerminalRenderer:
             self._console.print(thinking_delta(event.thinking), end="")
             self._mark_assistant_output(event.thinking, "thinking")
         if event.text:
-            self._assistant_text_chunks.append(event.text)
+            self._stop_status_for_visible_output()
+            self._ensure_pending_block_gap()
+            self._ensure_text_gap_after_thinking()
+            self._console.print(assistant_text_delta(event.text), end="")
+            self._mark_assistant_output(event.text, "text")
 
     def _handle_message_end(self, event: SessionEvent) -> None:
         """在 user 或 assistant 消息结束时补齐对应的终端输出。"""

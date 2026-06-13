@@ -1,4 +1,5 @@
 .agentcode/config.yaml
+.agentcode/permissions.local.yaml
 __pycache__/
 *.py[cod]
 .DS_Store

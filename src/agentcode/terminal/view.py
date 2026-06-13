@@ -17,6 +17,12 @@ def assistant_markdown(text: str) -> RenderableType:
     return Markdown(text)
 
 
+def assistant_text_delta(text: str) -> Text:
+    """渲染 assistant 正文增量，避免 Rich markup 误解析模型输出。"""
+
+    return Text(text)
+
+
 def user_block(text: str) -> Text:
     """渲染用户消息块，便于在 scrollback 中区分输入和回复。"""
 

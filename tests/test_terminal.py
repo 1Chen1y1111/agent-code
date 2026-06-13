@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from agentcode.llm import (
     ToolCall,
     Usage,
 )
+from agentcode.permission import PermissionPolicy, load_permission_config
 from agentcode.terminal.app import PROMPT_STYLE, TerminalApp, TerminalRenderer
 from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
 
@@ -40,14 +42,15 @@ async def test_single_provider_enters_prompt_loop_and_exits() -> None:
         prompt_reader=prompt,
         provider_factory=lambda _: provider,
         clock=Clock([10.0, 10.1]),
+        permission_policy=_permission_policy(),
     )
 
     await app.run_async()
 
     assert prompt.prompts == ["❯ ", "❯ "]
     assert prompt.bottom_toolbars == [
-        "\nprovider: Fake · model: fake-model",
-        "\nprovider: Fake · model: fake-model",
+        "\npermission: default · model: fake-model",
+        "\npermission: default · model: fake-model",
     ]
     assert "erase_when_done" not in prompt.kwargs[0]
     assert "erase_when_done" not in prompt.kwargs[1]
@@ -55,7 +58,7 @@ async def test_single_provider_enters_prompt_loop_and_exits() -> None:
     assert prompt.kwargs[1]["style"] is PROMPT_STYLE
     assert provider.requests[0].messages[0].content == "hi"
     rendered = output.getvalue()
-    assert "provider: Fake · model: fake-model" not in rendered
+    assert "permission: default · model: fake-model" not in rendered
     assert "● hi" in rendered
     assert "● hi\n\nok" in rendered
     assert "ok" in rendered
@@ -78,12 +81,13 @@ async def test_multiple_provider_selection_retries_invalid_input() -> None:
         console=_console(output),
         prompt_reader=prompt,
         provider_factory=lambda cfg: provider.with_name(cfg.name, cfg.model),
+        permission_policy=_permission_policy(),
     )
 
     await app.run_async()
 
     assert prompt.prompts == ["provider> ", "provider> ", "❯ "]
-    assert prompt.bottom_toolbars == [None, None, "\nprovider: Two · model: two-model"]
+    assert prompt.bottom_toolbars == [None, None, "\npermission: default · model: two-model"]
     assert all("erase_when_done" not in kwargs for kwargs in prompt.kwargs)
     assert "style" not in prompt.kwargs[0]
     assert "style" not in prompt.kwargs[1]
@@ -110,6 +114,7 @@ async def test_prompt_eof_exits_without_turn() -> None:
         console=_console(output),
         prompt_reader=prompt,
         provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(),
     )
 
     await app.run_async()
@@ -141,6 +146,7 @@ async def test_tool_events_are_appended_to_scrollback() -> None:
         prompt_reader=prompt,
         provider_factory=lambda _: provider,
         clock=Clock([1.0, 1.1]),
+        permission_policy=_permission_policy(),
     )
 
     await app.run_async()
@@ -160,7 +166,7 @@ async def test_tool_events_are_appended_to_scrollback() -> None:
 
 
 def test_renderer_does_not_duplicate_final_streamed_text() -> None:
-    """流式正文会缓存到 message_end，并且最终只渲染一次。"""
+    """流式正文会即时输出，并且 message_end 不重复渲染。"""
 
     output = io.StringIO()
     renderer = TerminalRenderer(_console(output), Clock([100.0, 100.01]))
@@ -170,7 +176,7 @@ def test_renderer_does_not_duplicate_final_streamed_text() -> None:
     renderer.render(_event("message_update", text="hel"))
     renderer.render(_event("message_update", text="lo"))
 
-    assert output.getvalue() == ""
+    assert output.getvalue() == "hello"
 
     renderer.render(_event("message_end", message=message))
     renderer.render(_event("agent_end"))
@@ -196,7 +202,7 @@ def test_renderer_prints_final_text_when_provider_did_not_stream_delta() -> None
 
 
 def test_renderer_renders_assistant_text_as_markdown() -> None:
-    """assistant 正文在 message_end 时按 Markdown 渲染，而不是原样输出标记。"""
+    """没有正文 delta 时，assistant 正文在 message_end 兜底按 Markdown 渲染。"""
 
     output = io.StringIO()
     renderer = TerminalRenderer(_console(output), Clock([100.0, 100.01]))
@@ -204,8 +210,6 @@ def test_renderer_renders_assistant_text_as_markdown() -> None:
     message = AssistantMessage(content=[TextContent(text=text)])
 
     renderer.render(_event("agent_start"))
-    renderer.render(_event("message_update", text="# 标题\n\n"))
-    renderer.render(_event("message_update", text="- A\n\n```python\nprint(1)\n```"))
 
     assert output.getvalue() == ""
 
@@ -306,7 +310,7 @@ def test_renderer_separates_parallel_tool_results() -> None:
 
 
 def test_renderer_status_stops_before_visible_output() -> None:
-    """缓存正文结束渲染为可见输出前，临时 Working 状态会被关闭。"""
+    """正文增量渲染为可见输出前，临时 Working 状态会被关闭。"""
 
     output = io.StringIO()
     renderer = TerminalRenderer(_console(output), Clock([1.0, 1.1]))
@@ -318,14 +322,116 @@ def test_renderer_status_stops_before_visible_output() -> None:
     assert output.getvalue() == "● hi\n\n"
 
     renderer.render(_event("message_update", text="ok"))
-    assert renderer._status is not None  # noqa: SLF001
-    assert output.getvalue() == "● hi\n\n"
+    assert renderer._status is None  # noqa: SLF001
+    assert output.getvalue() == "● hi\n\nok"
 
     renderer.render(_event("message_end", message=message))
 
     assert renderer._status is None  # noqa: SLF001
     assert "Working..." not in output.getvalue()
     assert "ok" in output.getvalue()
+
+
+def test_permission_mode_cycles_and_updates_toolbar() -> None:
+    """Shift+Tab 绑定背后的切换逻辑会循环更新状态栏。"""
+
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        Registry(),
+        console=_console(io.StringIO()),
+        prompt_reader=FakePrompt([]),
+        provider_factory=lambda _: FakeProvider([]),
+        permission_policy=_permission_policy(),
+    )
+    app.provider = FakeProvider([])
+
+    app._cycle_permission_mode()  # noqa: SLF001
+    assert app._bottom_toolbar() == "\npermission: acceptEdits · model: fake-model"
+    app._cycle_permission_mode()  # noqa: SLF001
+    assert app._bottom_toolbar() == "\npermission: plan · model: fake-model"
+    app._cycle_permission_mode()  # noqa: SLF001
+    assert app._bottom_toolbar() == "\npermission: bypassPermissions · model: fake-model"
+    app._cycle_permission_mode()  # noqa: SLF001
+    assert app._bottom_toolbar() == "\npermission: default · model: fake-model"
+
+
+@pytest.mark.asyncio
+async def test_permission_ask_menu_allows_once(tmp_path: Path) -> None:
+    """命令工具在 default 模式下会弹出审批菜单，允许本次后才执行。"""
+
+    output = io.StringIO()
+    registry = Registry()
+    registry.register(UpdatingBashTool())
+    provider = FakeProvider(
+        [
+            _assistant_events(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="bash",
+                        arguments={"command": "echo hi"},
+                    )
+                ],
+            ),
+            _assistant_events(text="完成"),
+        ]
+    )
+    prompt = FakePrompt(["run", "1", "/exit"])
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        registry,
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+    )
+
+    await app.run_async()
+
+    rendered = output.getvalue()
+    assert "+-- 权限确认" in rendered
+    assert "工具: Bash" in rendered
+    assert "Esc/Ctrl+C 取消\n\n" in rendered
+    assert "Esc/Ctrl+C 取消\n\n\n" not in rendered
+    assert "⎿ bash ok" in rendered
+    assert prompt.prompts == ["❯ ", "permission> ", "❯ "]
+
+
+@pytest.mark.asyncio
+async def test_plan_and_do_commands_switch_modes(tmp_path: Path) -> None:
+    """`/plan` 只暴露只读工具，`/do` 固定切回 default 并提交执行提示。"""
+
+    output = io.StringIO()
+    registry = Registry()
+    registry.register(UpdatingTool())
+    registry.register(UpdatingBashTool())
+    provider = FakeProvider(
+        [
+            _assistant_events(text="计划"),
+            _assistant_events(text="执行"),
+        ]
+    )
+    prompt = FakePrompt(["/plan", "think", "/do", "/exit"])
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        registry,
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+    )
+
+    await app.run_async()
+
+    assert provider.requests[0].tools is not None
+    assert [tool.name for tool in provider.requests[0].tools] == ["read"]
+    assert provider.requests[1].messages[-1].content == "按计划执行。"
+    assert prompt.bottom_toolbars == [
+        "\npermission: default · model: fake-model",
+        "\npermission: plan · model: fake-model",
+        "\npermission: plan · model: fake-model",
+        "\npermission: default · model: fake-model",
+    ]
 
 
 class FakePrompt:
@@ -343,7 +449,10 @@ class FakePrompt:
         """返回下一条脚本输入，异常对象会按原样抛出。"""
 
         self.prompts.append(message)
-        self.bottom_toolbars.append(kwargs.get("bottom_toolbar"))
+        bottom_toolbar = kwargs.get("bottom_toolbar")
+        if callable(bottom_toolbar):
+            bottom_toolbar = bottom_toolbar()
+        self.bottom_toolbars.append(bottom_toolbar)
         self.kwargs.append(kwargs)
         if not self._inputs:
             raise EOFError
@@ -423,6 +532,44 @@ class UpdatingTool(BaseTool):
         return text_result("file content")
 
 
+class UpdatingBashTool(BaseTool):
+    """测试用 bash 工具，记录审批通过后的执行结果。"""
+
+    def name(self) -> str:
+        """返回工具名。"""
+
+        return "bash"
+
+    def description(self) -> str:
+        """返回 provider tools 中使用的工具说明。"""
+
+        return "bash"
+
+    def parameters(self) -> dict[str, object]:
+        """声明 bash 测试工具接受 command 参数。"""
+
+        return {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }
+
+    def execution_mode(self) -> ExecutionMode:
+        """声明命令工具必须串行执行。"""
+
+        return "sequential"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: dict[str, Any],
+        on_update: ToolUpdate | None = None,
+    ) -> ToolResult:
+        """返回固定结果，证明审批后执行了真实工具。"""
+
+        return text_result("bash ok")
+
+
 class Clock:
     """测试用时钟，按顺序返回固定时间。"""
 
@@ -443,6 +590,22 @@ def _console(output: io.StringIO) -> Console:
     """创建测试用 Rich Console，关闭颜色以便断言纯文本。"""
 
     return Console(file=output, force_terminal=False, color_system=None, width=120)
+
+
+def _permission_policy(root: Path | None = None) -> PermissionPolicy:
+    """创建不读取用户真实配置的测试权限策略。"""
+
+    project_root = root or Path.cwd()
+    missing = project_root / "missing-permissions.yaml"
+    return PermissionPolicy(
+        project_root,
+        load_permission_config(
+            project_root,
+            user_path=missing,
+            project_path=missing,
+            local_path=project_root / "permissions.local.yaml",
+        ),
+    )
 
 
 def _provider(name: str, protocol: str) -> ProviderConfig:

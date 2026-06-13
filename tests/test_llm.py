@@ -84,6 +84,44 @@ class AnthropicProviderTests(unittest.TestCase):
             request["thinking"], {"type": "enabled", "budget_tokens": 2048}
         )
 
+    def test_stream_suppresses_thinking_when_disabled(self) -> None:
+        events = [
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="thinking_delta", thinking="hidden"),
+            ),
+            SimpleNamespace(type="text", text="visible", snapshot="visible"),
+        ]
+        fake_client = FakeAnthropicClient(events)
+        provider = AnthropicProvider(
+            _cfg("anthropic", thinking=False), client=fake_client
+        )
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(_deltas(chunks, "thinking_delta"), [])
+        self.assertEqual(_deltas(chunks, "text_delta"), ["visible"])
+        self.assertNotIn("thinking", fake_client.messages.requests[0])
+
+    def test_deepseek_anthropic_endpoint_sends_disabled_thinking(self) -> None:
+        fake_client = FakeAnthropicClient([])
+        provider = AnthropicProvider(
+            _cfg(
+                "anthropic",
+                thinking=False,
+                base_url="https://api.deepseek.com/anthropic",
+            ),
+            client=fake_client,
+        )
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(chunks[-1].type, "done")
+        self.assertEqual(
+            fake_client.messages.requests[0]["thinking"],
+            {"type": "disabled"},
+        )
+
     def test_stream_options_map_safe_request_fields(self) -> None:
         fake_client = FakeAnthropicClient([])
         provider = AnthropicProvider(_cfg("anthropic"), client=fake_client)
@@ -353,6 +391,26 @@ class OpenAIProviderTests(unittest.TestCase):
         self.assertEqual(request["prompt_cache_key"], "session-1")
         self.assertEqual(request["prompt_cache_retention"], "24h")
 
+    def test_deepseek_openai_endpoint_sends_thinking_toggle(self) -> None:
+        fake_client = FakeOpenAIClient([])
+        provider = OpenAIProvider(
+            _cfg(
+                "openai",
+                thinking=False,
+                base_url="https://api.deepseek.com",
+            ),
+            client=fake_client,
+        )
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(chunks[-1].type, "done")
+        request = fake_client.chat.completions.requests[0]
+        self.assertEqual(
+            request["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+
     def test_stream_extracts_openai_cache_usage(self) -> None:
         fake_client = FakeOpenAIClient(
             [
@@ -417,11 +475,33 @@ class OpenAIProviderTests(unittest.TestCase):
                 )
             ]
         )
-        provider = OpenAIProvider(_cfg("openai"), client=fake_client)
+        provider = OpenAIProvider(_cfg("openai", thinking=True), client=fake_client)
 
         chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
 
         self.assertEqual(_deltas(chunks, "thinking_delta"), ["thinking"])
+        self.assertEqual(_deltas(chunks, "text_delta"), ["answer"])
+
+    def test_stream_suppresses_reasoning_when_thinking_disabled(self) -> None:
+        fake_client = FakeOpenAIClient(
+            [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                reasoning_content="thinking",
+                                content="answer",
+                            )
+                        )
+                    ]
+                )
+            ]
+        )
+        provider = OpenAIProvider(_cfg("openai", thinking=False), client=fake_client)
+
+        chunks = asyncio.run(_collect(provider.stream(_context("hi"))))
+
+        self.assertEqual(_deltas(chunks, "thinking_delta"), [])
         self.assertEqual(_deltas(chunks, "text_delta"), ["answer"])
 
     def test_constructor_passes_base_url_when_present(self) -> None:

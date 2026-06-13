@@ -101,13 +101,12 @@ class AnthropicProvider:
             request["temperature"] = stream_options.temperature
         if context.tools:
             request["tools"] = _to_anthropic_tools(context.tools, cache_control)
-        if self._cfg.thinking and not _has_tool_history(context.messages):
+        thinking_enabled = self._cfg.thinking and not _has_tool_history(context.messages)
+        thinking_request = _thinking_request(self._cfg, thinking_enabled)
+        if thinking_request is not None:
             # Anthropic thinking replay 需要签名；当前协议已能保存 thinking block，
             # 但没有实现签名回放，所以已有工具历史时仍禁用 thinking。
-            request["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": DEFAULT_THINKING_BUDGET_TOKENS,
-            }
+            request["thinking"] = thinking_request
 
         content: list[AssistantContent] = []
         text = ""
@@ -120,7 +119,7 @@ class AnthropicProvider:
         try:
             async with self._client.messages.stream(**request) as stream:
                 async for event in stream:
-                    thinking_delta = _extract_thinking_delta(event)
+                    thinking_delta = _extract_thinking_delta(event) if thinking_enabled else ""
                     if thinking_delta:
                         if thinking_index is None:
                             thinking_index = len(content)
@@ -255,6 +254,29 @@ def _done_reason(reason: ModelStopReason) -> DoneStopReason:
     if reason in ("stop", "length", "toolUse"):
         return reason
     return "stop"
+
+
+def _thinking_request(
+    cfg: ProviderConfig,
+    thinking_enabled: bool,
+) -> dict[str, Any] | None:
+    """生成 thinking 请求参数，DeepSeek 需要显式 disabled 才是非思考。"""
+
+    if thinking_enabled:
+        return {
+            "type": "enabled",
+            "budget_tokens": DEFAULT_THINKING_BUDGET_TOKENS,
+        }
+    if _is_deepseek_endpoint(cfg):
+        return {"type": "disabled"}
+    return None
+
+
+def _is_deepseek_endpoint(cfg: ProviderConfig) -> bool:
+    """判断当前配置是否指向 DeepSeek 官方或 DeepSeek 命名模型。"""
+
+    base_url = (cfg.base_url or "").lower()
+    return "deepseek" in base_url or cfg.model.lower().startswith("deepseek-")
 
 
 def _to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:

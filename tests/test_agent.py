@@ -35,6 +35,7 @@ from agentcode.prompt import (
     PromptContextFile,
     SupplementalInstruction,
 )
+from agentcode.permission import PermissionPolicy, load_permission_config
 from agentcode.session import AgentSession
 from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
 
@@ -389,6 +390,139 @@ async def test_agent_system_prompt_uses_tool_prompt_metadata() -> None:
     assert "- meta: Short prompt snippet" in system_prompt
     assert "Use meta carefully." in system_prompt
     assert "Provider-only description" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_denies_tool_without_executing_and_continues(tmp_path) -> None:
+    local = tmp_path / "permissions.local.yaml"
+    local.write_text(
+        """
+deny:
+  - Bash(echo blocked)
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    policy = PermissionPolicy(
+        tmp_path,
+        load_permission_config(
+            tmp_path,
+            user_path=tmp_path / "missing-user.yaml",
+            project_path=tmp_path / "missing-project.yaml",
+            local_path=local,
+        ),
+    )
+    conv = Conversation()
+    conv.add_user("run")
+    provider = FakeProvider(
+        [
+            _assistant_events(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="bash",
+                        arguments={"command": "echo blocked"},
+                    )
+                ]
+            ),
+            _assistant_events(text="换个办法"),
+        ]
+    )
+    registry = RecordingRegistry()
+    registry.register(FakeTool("bash", "should not run", "sequential"))
+
+    events = [
+        event
+        async for event in Agent(provider, registry).run(
+            conv,
+            AgentRunOptions(permission_policy=policy),
+        )
+    ]
+
+    assert registry.calls == []
+    tool_results = [
+        message for message in conv.messages() if message.role == "toolResult"
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_call_id == "call_1"
+    assert tool_results[0].is_error
+    assert tool_results[0].details["permission_denied"] is True
+    assert tool_results[0].details["source"] == "rule"
+    assert "权限拒绝" in message_text(tool_results[0])
+    assert events[-1].stop_reason == "completed"
+    assert message_text(conv.messages()[-1]) == "换个办法"
+
+
+@pytest.mark.asyncio
+async def test_agent_asks_permission_and_can_remember_allow(tmp_path) -> None:
+    local = tmp_path / "permissions.local.yaml"
+    policy = PermissionPolicy(
+        tmp_path,
+        load_permission_config(
+            tmp_path,
+            user_path=tmp_path / "missing-user.yaml",
+            project_path=tmp_path / "missing-project.yaml",
+            local_path=local,
+        ),
+    )
+    conv = Conversation()
+    conv.add_user("write")
+    provider = FakeProvider(
+        [
+            _assistant_events(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="write",
+                        arguments={"path": "note.txt"},
+                    )
+                ]
+            ),
+            _assistant_events(text="done"),
+        ]
+    )
+    registry = RecordingRegistry()
+    registry.register(FakeTool("write", "wrote", "sequential"))
+    requests = []
+
+    async def approve(request) -> str:
+        requests.append(request)
+        return "allow_always"
+
+    await _collect(
+        Agent(provider, registry).run(
+            conv,
+            AgentRunOptions(
+                permission_policy=policy,
+                permission_approver=approve,  # type: ignore[arg-type]
+            ),
+        )
+    )
+
+    assert registry.calls == [("write", {"path": "note.txt"})]
+    assert requests[0].exact_rule == "Write(note.txt)"
+    assert "Write(note.txt)" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_only_exposes_readonly_tools() -> None:
+    provider = FakeProvider([_assistant_events(text="计划")])
+    registry = RecordingRegistry()
+    registry.register(FakeTool("read", "read", "parallel"))
+    registry.register(FakeTool("write", "write", "sequential"))
+    registry.register(FakeTool("bash", "bash", "sequential"))
+    session = AgentSession(
+        provider,
+        registry,
+        permission_mode=lambda: "plan",
+    )
+
+    await _collect(session.prompt("plan"))
+
+    request = provider.requests[0]
+    assert request.tools is not None
+    assert [tool.name for tool in request.tools] == ["read"]
+    assert "plan mode" in str(request.messages[0].content)
 
 
 async def _collect(stream: AsyncIterator[object]) -> list[object]:

@@ -8,7 +8,7 @@ UI、配置加载、会话持久化或用户输入命令。
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
@@ -40,6 +40,15 @@ from agentcode.prompt import (
     build_system_prompt,
     format_supplemental_instruction,
 )
+from agentcode.permission import (
+    PermissionApproval,
+    PermissionCheck,
+    PermissionMode,
+    PermissionPolicy,
+    PermissionRequest,
+    PermissionSource,
+    denied_tool_result_text,
+)
 from agentcode.tool import (
     DEFAULT_TIMEOUT,
     ExecutionMode,
@@ -54,6 +63,7 @@ DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_MAX_UNKNOWN_TOOLS = 2
 MAX_ITERATIONS_MESSAGE = "已达到本轮 Agent Loop 迭代上限，已停止继续调用工具。"
 UNKNOWN_TOOL_LIMIT_MESSAGE = "连续请求未知工具，Agent Loop 已停止。"
+PermissionApprover = Callable[[PermissionRequest], Awaitable[PermissionApproval]]
 
 EventType = Literal[
     "turn_start",
@@ -89,6 +99,10 @@ class AgentRunOptions:
     supplemental_instructions: tuple[SupplementalInstruction, ...] = ()
     cache_retention: Literal["none", "short", "long"] | None = "short"
     session_id: str | None = None
+    permission_policy: PermissionPolicy | None = None
+    permission_mode: PermissionMode = "default"
+    permission_approver: PermissionApprover | None = None
+    visible_tool_names: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +173,10 @@ class Agent:
                 )
                 assistant_message: AssistantMessage | None = None
                 message_started = False
-                tools = self._registry.definitions()
+                tools = _visible_tool_definitions(
+                    self._registry.definitions(),
+                    run_options.visible_tool_names,
+                )
                 context = _build_context(
                     conv,
                     tools,
@@ -227,6 +244,7 @@ class Agent:
                 async for tool_event, outcome in _execute_tool_calls(
                     self._registry,
                     tool_calls,
+                    run_options,
                 ):
                     if tool_event is not None:
                         yield tool_event
@@ -272,6 +290,7 @@ class Agent:
 async def _execute_tool_calls(
     registry: Registry,
     calls: list[ToolCall],
+    run_options: AgentRunOptions,
 ) -> AsyncIterator[tuple[AgentEvent | None, _ToolOutcome | None]]:
     """按工具安全策略分批执行，并保持结果回灌顺序稳定。"""
 
@@ -282,7 +301,7 @@ async def _execute_tool_calls(
                 yield _tool_start_event(call), None
             results = await asyncio.gather(
                 *[
-                    _run_tool(registry, index, call)
+                    _run_tool(registry, index, call, run_options)
                     for index, call in batch
                 ]
             )
@@ -295,7 +314,7 @@ async def _execute_tool_calls(
 
         for index, call in batch:
             yield _tool_start_event(call), None
-            _, outcome, updates = await _run_tool(registry, index, call)
+            _, outcome, updates = await _run_tool(registry, index, call, run_options)
             for update in updates:
                 yield _tool_update_event(outcome.call, update), None
             indexed_outcomes.append((index, outcome))
@@ -352,6 +371,7 @@ async def _run_tool(
     registry: Registry,
     index: int,
     call: ToolCall,
+    run_options: AgentRunOptions,
 ) -> tuple[int, _ToolOutcome, list[ToolResult]]:
     """执行单个工具调用，并把未知工具转成可回灌的错误结果。"""
 
@@ -359,13 +379,7 @@ async def _run_tool(
     if not _tool_is_available(registry, call.name):
         result = text_result(f"未知工具: {call.name}", is_error=True)
     else:
-        result = await registry.execute(
-            call.id,
-            call.name,
-            call.arguments,
-            timeout=DEFAULT_TIMEOUT,
-            on_update=updates.append,
-        )
+        result = await _run_permitted_tool(registry, call, run_options, updates)
     return (
         index,
         _ToolOutcome(
@@ -374,6 +388,75 @@ async def _run_tool(
             args_preview=_preview_args(call.arguments),
         ),
         updates,
+    )
+
+
+async def _run_permitted_tool(
+    registry: Registry,
+    call: ToolCall,
+    run_options: AgentRunOptions,
+    updates: list[ToolResult],
+) -> ToolResult:
+    """先做权限判定，通过后再执行真实工具。"""
+
+    if run_options.permission_policy is not None:
+        check = run_options.permission_policy.evaluate(
+            call.name,
+            call.arguments,
+            run_options.permission_mode,
+        )
+        if check.verdict == "deny":
+            return _permission_denied_result(check.source, check.reason)
+        if check.verdict == "ask":
+            approval = await _resolve_permission_request(check, run_options)
+            if approval == "cancel":
+                return _permission_denied_result(
+                    "human",
+                    "用户取消权限确认，当前轮停止",
+                    terminate=True,
+                )
+            if approval == "deny_once":
+                return _permission_denied_result("human", "用户拒绝本次工具调用")
+            if approval == "allow_always" and check.request is not None:
+                run_options.permission_policy.remember_allow(check.request)
+
+    return await registry.execute(
+        call.id,
+        call.name,
+        call.arguments,
+        timeout=DEFAULT_TIMEOUT,
+        on_update=updates.append,
+    )
+
+
+async def _resolve_permission_request(
+    check: PermissionCheck,
+    run_options: AgentRunOptions,
+) -> PermissionApproval:
+    """把 Ask 判定交给上层审批回调，缺失回调时保守拒绝。"""
+
+    if check.request is None or run_options.permission_approver is None:
+        return "deny_once"
+    return await run_options.permission_approver(check.request)
+
+
+def _permission_denied_result(
+    source: PermissionSource,
+    reason: str,
+    *,
+    terminate: bool = False,
+) -> ToolResult:
+    """创建结构化权限拒绝工具结果，供模型继续调整策略。"""
+
+    return text_result(
+        denied_tool_result_text(source, reason),
+        is_error=True,
+        details={
+            "permission_denied": True,
+            "source": source,
+            "reason": reason,
+        },
+        terminate=terminate,
     )
 
 
@@ -418,6 +501,18 @@ def _tool_is_available(registry: Registry, name: str) -> bool:
     """判断模型请求的工具是否已注册。"""
 
     return registry.get(name) is not None
+
+
+def _visible_tool_definitions(
+    tools: list[ToolDefinition],
+    visible_tool_names: tuple[str, ...] | None,
+) -> list[ToolDefinition]:
+    """按运行模式过滤本轮暴露给模型的工具定义。"""
+
+    if visible_tool_names is None:
+        return tools
+    visible = set(visible_tool_names)
+    return [tool for tool in tools if tool.name in visible]
 
 
 def _build_context(
