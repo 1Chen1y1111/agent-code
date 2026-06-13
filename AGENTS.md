@@ -24,9 +24,9 @@ AGENTS.md
 
 ```python
 """
-AgentCode 的 Textual TUI 主应用。
+AgentCode 的普通终端 CLI 应用。
 
-负责 provider 选择、对话状态机、流式消费、计时展示和自绘聊天输入框。
+负责 provider 选择、prompt_toolkit 输入循环，以及把 Session 事件追加渲染到终端 scrollback。
 """
 
 from __future__ import annotations

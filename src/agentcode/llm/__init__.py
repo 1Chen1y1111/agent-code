@@ -394,7 +394,7 @@ AssistantMessageEvent = (
 
 
 class Provider(Protocol):
-    # 上层只依赖这个协议接口，因此新增后端时不需要改 TUI。
+    # 上层只依赖这个协议接口，因此新增后端时不需要改 UI。
     @property
     def api(self) -> Api:
         """返回 provider 使用的 API 协议名。"""

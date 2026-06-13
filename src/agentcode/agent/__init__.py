@@ -2,7 +2,7 @@
 AgentCode 的底层 Agent Core。
 
 负责 ReAct 循环、模型流式收集、工具分批执行和生命周期事件输出；不处理
-TUI、配置加载、会话持久化或用户输入命令。
+UI、配置加载、会话持久化或用户输入命令。
 """
 
 from __future__ import annotations
@@ -516,7 +516,7 @@ def _append_stop_message(
 
 
 def _preview_args(args: dict[str, object]) -> str:
-    """生成工具参数的单行预览，避免 TUI 中长 JSON 撑开消息。"""
+    """生成工具参数的单行预览，避免 UI 中长 JSON 撑开消息。"""
 
     compact = json.dumps(args or {}, ensure_ascii=False, separators=(",", ":"))
     if len(compact) <= TOOL_ARG_PREVIEW_CHARS:

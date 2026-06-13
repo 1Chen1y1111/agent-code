@@ -188,6 +188,7 @@ def render_banner(version: str, cwd: str) -> Text:
 
     # 直接返回 Rich Text，避免开启 markup 后误解析用户内容里的方括号。
     banner = Text()
+    banner.append("\n")
     banner.append(f"{PET_BANNER}\n\n", style="bold yellow")
     banner.append("AgentCode ", style="bold cyan")
     banner.append(f"v{version}\n\n", style="bold white")

@@ -22,7 +22,7 @@ SessionEventType = Literal["agent_start"] | EventType
 
 @dataclass(frozen=True, slots=True)
 class SessionEvent:
-    """AgentSession 对 TUI/模式层暴露的统一事件。"""
+    """AgentSession 对 UI/模式层暴露的统一事件。"""
 
     type: SessionEventType
     message: Message | None = None
