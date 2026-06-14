@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 
 from agentcode.config import ConfigError, load
+from agentcode.mcp import load_mcp_server_configs
 from agentcode.resource_loader import load_prompt_resources
 from agentcode.terminal import TerminalApp
 from agentcode.tool import create_default_registry
@@ -37,8 +38,10 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     prompt_resources = load_prompt_resources(Path.cwd())
+    mcp_configs = load_mcp_server_configs(Path.cwd())
     TerminalApp(
         config.providers,
         create_default_registry(),
         prompt_resources.prompt_options,
+        mcp_configs=mcp_configs,
     ).run()

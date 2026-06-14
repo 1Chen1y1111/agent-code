@@ -205,7 +205,10 @@ class Agent:
                         )
                         yield AgentEvent(type="agent_end", stop_reason="error")
                         return
-                    if isinstance(stream_event, ThinkingDeltaEvent) and stream_event.delta:
+                    if (
+                        isinstance(stream_event, ThinkingDeltaEvent)
+                        and stream_event.delta
+                    ):
                         yield AgentEvent(
                             type="message_update",
                             thinking=stream_event.delta,
@@ -404,6 +407,7 @@ async def _run_permitted_tool(
             call.name,
             call.arguments,
             run_options.permission_mode,
+            category_override=registry.permission_category(call.name),
         )
         if check.verdict == "deny":
             return _permission_denied_result(check.source, check.reason)
@@ -541,19 +545,11 @@ def _resolve_prompt_options(
     selected_tools = options.selected_tools or tuple(tool.name for tool in tools)
     tool_snippets = {
         **DEFAULT_TOOL_SNIPPETS,
-        **{
-            tool.name: tool.prompt_snippet
-            for tool in tools
-            if tool.prompt_snippet
-        },
+        **{tool.name: tool.prompt_snippet for tool in tools if tool.prompt_snippet},
         **dict(options.tool_snippets),
     }
     prompt_guidelines = _unique_prompt_guidelines(
-        [
-            guideline
-            for tool in tools
-            for guideline in tool.prompt_guidelines
-        ],
+        [guideline for tool in tools for guideline in tool.prompt_guidelines],
         options.prompt_guidelines,
     )
     return replace(

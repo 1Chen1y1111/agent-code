@@ -118,7 +118,7 @@ class AgentSession:
             permission_policy=self._permission_policy,
             permission_mode=mode,
             permission_approver=self._permission_approver,
-            visible_tool_names=PLAN_TOOL_NAMES if mode == "plan" else None,
+            visible_tool_names=_mode_visible_tool_names(mode, self._registry),
         )
         async for event in agent.run(self._conversation, run_options):
             yield SessionEvent.from_agent(event)
@@ -132,3 +132,19 @@ def _mode_supplemental_instructions(
     if mode != "plan":
         return ()
     return (SupplementalInstruction(source="permission_mode", content=PLAN_REMINDER),)
+
+
+def _mode_visible_tool_names(
+    mode: PermissionMode,
+    registry: Registry,
+) -> tuple[str, ...] | None:
+    """根据权限模式返回本轮可暴露给模型的工具名，非 plan 模式不限制。"""
+
+    if mode != "plan":
+        return None
+    readonly_names = {
+        name
+        for name in registry.names()
+        if name in PLAN_TOOL_NAMES or registry.permission_category(name) == "readonly"
+    }
+    return tuple(name for name in registry.names() if name in readonly_names)

@@ -183,7 +183,7 @@ PET_BANNER = r"""
 """.strip("\n")
 
 
-def render_banner(version: str, cwd: str) -> Text:
+def render_banner(version: str, cwd: str, mcp_tool_count: int = 0) -> Text:
     """生成启动时展示的 ASCII banner 和当前工作目录信息。"""
 
     # 直接返回 Rich Text，避免开启 markup 后误解析用户内容里的方括号。
@@ -195,7 +195,10 @@ def render_banner(version: str, cwd: str) -> Text:
     banner.append("cwd: ", style="dim")
     banner.append(f"{cwd}\n\n", style="cyan")
     banner.append("Ready. ", style="bold green")
-    banner.append("Tools enabled. No MCP.\n\n", style="dim")
+    if mcp_tool_count:
+        banner.append(f"Tools enabled. MCP tools: {mcp_tool_count}.\n\n", style="dim")
+    else:
+        banner.append("Tools enabled. No MCP.\n\n", style="dim")
     return banner
 
 

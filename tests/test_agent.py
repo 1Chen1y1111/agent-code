@@ -35,9 +35,16 @@ from agentcode.prompt import (
     PromptContextFile,
     SupplementalInstruction,
 )
-from agentcode.permission import PermissionPolicy, load_permission_config
+from agentcode.permission import PermissionPolicy, ToolCategory, load_permission_config
 from agentcode.session import AgentSession
-from agentcode.tool import BaseTool, ExecutionMode, Registry, ToolResult, ToolUpdate, text_result
+from agentcode.tool import (
+    BaseTool,
+    ExecutionMode,
+    Registry,
+    ToolResult,
+    ToolUpdate,
+    text_result,
+)
 
 
 @pytest.mark.asyncio
@@ -115,9 +122,7 @@ async def test_agent_stops_at_iteration_limit_after_tool_result() -> None:
     provider = FakeProvider(
         [
             [
-                *_assistant_events(
-                    tool_calls=[ToolCall(id="call_1", name="read")]
-                ),
+                *_assistant_events(tool_calls=[ToolCall(id="call_1", name="read")]),
             ]
         ]
     )
@@ -145,14 +150,10 @@ async def test_agent_stops_after_repeated_unknown_tools() -> None:
     provider = FakeProvider(
         [
             [
-                *_assistant_events(
-                    tool_calls=[ToolCall(id="call_1", name="missing")]
-                ),
+                *_assistant_events(tool_calls=[ToolCall(id="call_1", name="missing")]),
             ],
             [
-                *_assistant_events(
-                    tool_calls=[ToolCall(id="call_2", name="missing")]
-                ),
+                *_assistant_events(tool_calls=[ToolCall(id="call_2", name="missing")]),
             ],
         ]
     )
@@ -251,9 +252,7 @@ async def test_agent_forwards_tool_updates_and_terminates_when_requested() -> No
     provider = FakeProvider(
         [
             [
-                *_assistant_events(
-                    tool_calls=[ToolCall(id="call_1", name="stop")]
-                ),
+                *_assistant_events(tool_calls=[ToolCall(id="call_1", name="stop")]),
             ]
         ]
     )
@@ -262,9 +261,9 @@ async def test_agent_forwards_tool_updates_and_terminates_when_requested() -> No
 
     events = [event async for event in Agent(provider, registry).run(conv)]
 
-    assert [event.result for event in events if event.type == "tool_execution_update"] == [
-        "partial"
-    ]
+    assert [
+        event.result for event in events if event.type == "tool_execution_update"
+    ] == ["partial"]
     assert events[-1].type == "agent_end"
     assert events[-1].stop_reason == "tool_terminated"
     assert len(provider.requests) == 1
@@ -276,9 +275,7 @@ async def test_agent_streams_usage_and_thinking_without_storing_thinking() -> No
     conv.add_user("explain")
     usage = Usage(input=3, output=5, total_tokens=8)
     provider = FakeProvider(
-        [
-            _assistant_events(thinking="先分析", text="答案", usage=usage)
-        ]
+        [_assistant_events(thinking="先分析", text="答案", usage=usage)]
     )
     registry = RecordingRegistry()
 
@@ -308,7 +305,9 @@ async def test_agent_session_emits_user_events_and_keeps_history() -> None:
     assert events[2].message is not None
     assert events[2].message.role == "user"
     assert message_text(events[2].message) == "hi"
-    assert [(message.role, message_text(message)) for message in session.messages()] == [
+    assert [
+        (message.role, message_text(message)) for message in session.messages()
+    ] == [
         ("user", "hi"),
         ("assistant", "你好"),
     ]
@@ -364,7 +363,7 @@ async def test_agent_injects_supplemental_context_without_persisting_it() -> Non
     assert "Current working directory:" in request.system_prompt
     assert len(request.messages) == 2
     assert request.messages[0].role == "user"
-    assert "source=\"test\"" in str(request.messages[0].content)
+    assert 'source="test"' in str(request.messages[0].content)
     assert "Remember X" in str(request.messages[0].content)
     assert message_text(request.messages[1]) == "hi"
     assert [(message.role, message_text(message)) for message in conv.messages()] == [
@@ -506,6 +505,8 @@ async def test_agent_asks_permission_and_can_remember_allow(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_plan_mode_only_exposes_readonly_tools() -> None:
+    """plan 模式默认只暴露内置只读工具。"""
+
     provider = FakeProvider([_assistant_events(text="计划")])
     registry = RecordingRegistry()
     registry.register(FakeTool("read", "read", "parallel"))
@@ -523,6 +524,35 @@ async def test_plan_mode_only_exposes_readonly_tools() -> None:
     assert request.tools is not None
     assert [tool.name for tool in request.tools] == ["read"]
     assert "plan mode" in str(request.messages[0].content)
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_exposes_dynamic_readonly_tools() -> None:
+    """plan 模式允许暴露由 Registry 声明为 readonly 的动态工具。"""
+
+    provider = FakeProvider([_assistant_events(text="计划")])
+    registry = RecordingRegistry()
+    registry.register(FakeTool("read", "read", "parallel"))
+    registry.register(
+        FakeTool("mcp__github__get_issue", "issue", "parallel", "readonly")
+    )
+    registry.register(
+        FakeTool("mcp__github__create_issue", "issue", "sequential", "command")
+    )
+    session = AgentSession(
+        provider,
+        registry,
+        permission_mode=lambda: "plan",
+    )
+
+    await _collect(session.prompt("plan"))
+
+    request = provider.requests[0]
+    assert request.tools is not None
+    assert [tool.name for tool in request.tools] == [
+        "read",
+        "mcp__github__get_issue",
+    ]
 
 
 async def _collect(stream: AsyncIterator[object]) -> list[object]:
@@ -554,10 +584,17 @@ class FakeProvider:
 
 
 class FakeTool(BaseTool):
-    def __init__(self, name: str, content: str, mode: ExecutionMode) -> None:
+    def __init__(
+        self,
+        name: str,
+        content: str,
+        mode: ExecutionMode,
+        category: ToolCategory | None = None,
+    ) -> None:
         self._name = name
         self._content = content
         self._mode = mode
+        self._category = category
 
     def name(self) -> str:
         return self._name
@@ -570,6 +607,9 @@ class FakeTool(BaseTool):
 
     def execution_mode(self) -> ExecutionMode:
         return self._mode
+
+    def permission_category(self) -> ToolCategory | None:
+        return self._category
 
     async def execute(
         self,
@@ -596,9 +636,7 @@ class ConcurrencyProbe:
 
 
 class ProbeTool(FakeTool):
-    def __init__(
-        self, name: str, mode: ExecutionMode, probe: ConcurrencyProbe
-    ) -> None:
+    def __init__(self, name: str, mode: ExecutionMode, probe: ConcurrencyProbe) -> None:
         super().__init__(name, f"{name} done", mode)
         self._probe = probe
 

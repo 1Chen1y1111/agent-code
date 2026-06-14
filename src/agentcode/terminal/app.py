@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 import time
 from typing import Protocol, cast
@@ -23,6 +23,7 @@ from rich.status import Status
 from agentcode import __version__
 from agentcode.config import ProviderConfig
 from agentcode.llm import Provider, create_provider, message_text
+from agentcode.mcp import McpManager, McpServerConfig
 from agentcode.permission import (
     PermissionApproval,
     PermissionPolicy,
@@ -77,6 +78,10 @@ class TerminalApp:
         console: Console | None = None,
         prompt_reader: PromptReader | None = None,
         provider_factory: Callable[[ProviderConfig], Provider] = create_provider,
+        mcp_configs: Sequence[McpServerConfig] = (),
+        mcp_manager_factory: Callable[
+            [Sequence[McpServerConfig], Registry], McpManager
+        ] = McpManager,
         clock: Callable[[], float] = time.monotonic,
         permission_policy: PermissionPolicy | None = None,
     ) -> None:
@@ -94,6 +99,8 @@ class TerminalApp:
             ),
         )
         self._provider_factory = provider_factory
+        self._mcp_configs = tuple(mcp_configs)
+        self._mcp_manager_factory = mcp_manager_factory
         self._clock = clock
         self._permission_policy = permission_policy or PermissionPolicy.load(Path.cwd())
         self._permission_mode = self._permission_policy.default_mode()
@@ -113,48 +120,63 @@ class TerminalApp:
     async def run_async(self) -> None:
         """执行 provider 选择和主输入循环，直到用户退出或输入流结束。"""
 
-        self._console.print(render_banner(__version__, str(Path.cwd())), end="")
-        provider_config = await self._select_provider_config()
-        if provider_config is None:
-            return
-
-        self.provider = self._provider_factory(provider_config)
-        self.agent_session = AgentSession(
-            self.provider,
-            self._registry,
-            self._prompt_options,
-            permission_policy=self._permission_policy,
-            permission_mode=lambda: self._permission_mode,
-            permission_approver=self._approve_permission,
-        )
-
-        while True:
-            try:
-                raw_text = await self._prompt_reader.prompt_async(
-                    PROMPT_TEXT,
-                    bottom_toolbar=self._bottom_toolbar,
-                    style=PROMPT_STYLE,
-                    key_bindings=self._key_bindings,
+        mcp_manager: McpManager | None = None
+        mcp_tool_count = 0
+        try:
+            if self._mcp_configs:
+                mcp_manager = self._mcp_manager_factory(
+                    self._mcp_configs, self._registry
                 )
-            except EOFError:
-                break
-            except KeyboardInterrupt:
-                break
+                mcp_tool_count = await mcp_manager.start()
 
-            message = raw_text.strip()
-            if not message:
-                continue
-            if message in EXIT_COMMANDS:
-                break
-            if message == PLAN_COMMAND:
-                self._permission_mode = "plan"
-                self._console.print("已进入 plan 模式。\n", style="dim")
-                continue
-            if message == DO_COMMAND:
-                self._permission_mode = "default"
-                await self._run_turn(DO_PROMPT)
-                continue
-            await self._run_turn(message)
+            self._console.print(
+                render_banner(__version__, str(Path.cwd()), mcp_tool_count),
+                end="",
+            )
+            provider_config = await self._select_provider_config()
+            if provider_config is None:
+                return
+
+            self.provider = self._provider_factory(provider_config)
+            self.agent_session = AgentSession(
+                self.provider,
+                self._registry,
+                self._prompt_options,
+                permission_policy=self._permission_policy,
+                permission_mode=lambda: self._permission_mode,
+                permission_approver=self._approve_permission,
+            )
+
+            while True:
+                try:
+                    raw_text = await self._prompt_reader.prompt_async(
+                        PROMPT_TEXT,
+                        bottom_toolbar=self._bottom_toolbar,
+                        style=PROMPT_STYLE,
+                        key_bindings=self._key_bindings,
+                    )
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    break
+
+                message = raw_text.strip()
+                if not message:
+                    continue
+                if message in EXIT_COMMANDS:
+                    break
+                if message == PLAN_COMMAND:
+                    self._permission_mode = "plan"
+                    self._console.print("已进入 plan 模式。\n", style="dim")
+                    continue
+                if message == DO_COMMAND:
+                    self._permission_mode = "default"
+                    await self._run_turn(DO_PROMPT)
+                    continue
+                await self._run_turn(message)
+        finally:
+            if mcp_manager is not None:
+                await mcp_manager.close()
 
     async def _select_provider_config(self) -> ProviderConfig | None:
         """根据配置数量选择 provider；多 provider 时循环读取编号。"""

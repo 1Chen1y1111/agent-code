@@ -50,7 +50,9 @@ FRIENDLY_TOOL_NAMES: dict[str, str] = {
     "grep": "Grep",
     "ls": "Ls",
 }
-INTERNAL_TOOL_NAMES = {friendly: internal for internal, friendly in FRIENDLY_TOOL_NAMES.items()}
+INTERNAL_TOOL_NAMES = {
+    friendly: internal for internal, friendly in FRIENDLY_TOOL_NAMES.items()
+}
 PLAN_TOOL_NAMES = tuple(sorted(READONLY_TOOLS))
 PLAN_REMINDER = (
     "You are in plan mode. Inspect the project with read-only tools only, produce a "
@@ -58,7 +60,7 @@ PLAN_REMINDER = (
     "the user exits plan mode."
 )
 
-_RULE_RE = re.compile(r"^\s*([A-Za-z]+)\s*(?:\((.*)\))?\s*$", re.DOTALL)
+_RULE_RE = re.compile(r"^\s*([A-Za-z0-9_*?-]+)\s*(?:\((.*)\))?\s*$", re.DOTALL)
 _GLOB_CHARS = set("*?[")
 _DANGEROUS_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -194,6 +196,7 @@ class PermissionPolicy:
         tool_name: str,
         args: dict[str, Any],
         mode: PermissionMode,
+        category_override: ToolCategory | None = None,
     ) -> PermissionCheck:
         """按五层流水线判定一次工具调用是否允许执行。"""
 
@@ -209,7 +212,7 @@ class PermissionPolicy:
         if rule_result is not None:
             return rule_result
 
-        fallback = mode_fallback(tool_name, mode)
+        fallback = mode_fallback(tool_name, mode, category_override)
         if fallback == "allow":
             return PermissionCheck("allow", "mode", f"{mode} 模式允许该类工具")
 
@@ -379,10 +382,14 @@ def tool_category(tool_name: str) -> ToolCategory | None:
     return None
 
 
-def mode_fallback(tool_name: str, mode: PermissionMode) -> Literal["allow", "ask"]:
+def mode_fallback(
+    tool_name: str,
+    mode: PermissionMode,
+    category_override: ToolCategory | None = None,
+) -> Literal["allow", "ask"]:
     """返回规则未命中时权限模式给出的兜底裁决。"""
 
-    category = tool_category(tool_name)
+    category = category_override or tool_category(tool_name)
     if category == "readonly":
         return "allow"
     if mode == "bypassPermissions":
@@ -513,9 +520,7 @@ def _parse_rule(raw: str) -> PermissionRule | None:
     if match is None:
         return None
     friendly = match.group(1)
-    tool_name = internal_tool_name(friendly)
-    if tool_name is None:
-        return None
+    tool_name = internal_tool_name(friendly) or friendly
     pattern = match.group(2)
     return PermissionRule(
         tool_name=tool_name,
@@ -554,7 +559,11 @@ def _rules_match(
 def _rule_matches(rule: PermissionRule, tool_name: str, target: str) -> bool:
     """判断单条规则是否命中当前工具调用。"""
 
-    if rule.tool_name != tool_name:
+    if _has_glob(rule.tool_name):
+        tool_matches = fnmatch.fnmatchcase(tool_name, rule.tool_name)
+    else:
+        tool_matches = rule.tool_name == tool_name
+    if not tool_matches:
         return False
     if rule.pattern is None:
         return True

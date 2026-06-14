@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from agentcode.llm import TextContent, ToolDefinition, ToolResultContent
+from agentcode.permission import ToolCategory
 
 DEFAULT_TIMEOUT = 30.0
 ExecutionMode = Literal["parallel", "sequential"]
@@ -60,6 +61,10 @@ class Tool(Protocol):
         """返回工具执行安全分类，用于 Agent Loop 分批调度。"""
         ...
 
+    def permission_category(self) -> ToolCategory | None:
+        """返回权限兜底分类，未知时交给权限包按内置工具名判断。"""
+        ...
+
     def prepare_arguments(self, args: dict[str, Any]) -> dict[str, Any]:
         """在 schema 校验前修正模型传入的参数形态。"""
         ...
@@ -102,6 +107,11 @@ class BaseTool:
 
         return []
 
+    def permission_category(self) -> ToolCategory | None:
+        """默认不声明动态权限类别，由权限包按工具名兜底。"""
+
+        return None
+
 
 class Registry:
     """集中登记、导出和执行工具。"""
@@ -126,6 +136,11 @@ class Registry:
 
         return self._tools.get(name)
 
+    def names(self) -> tuple[str, ...]:
+        """按注册顺序返回当前工具名快照。"""
+
+        return tuple(self._order)
+
     def definitions(self) -> list[ToolDefinition]:
         """把注册工具转换为 provider 层统一工具定义。"""
 
@@ -145,6 +160,12 @@ class Registry:
 
         tool = self.get(name)
         return None if tool is None else tool.execution_mode()
+
+    def permission_category(self, name: str) -> ToolCategory | None:
+        """按工具名返回动态权限类别，未知或未声明时返回 None。"""
+
+        tool = self.get(name)
+        return None if tool is None else tool.permission_category()
 
     async def execute(
         self,
@@ -226,9 +247,7 @@ def text_result(
 def content_text(content: list[ToolResultContent]) -> str:
     """把工具结果文本块拼成 provider 和 UI 可展示的纯文本。"""
 
-    return "\n".join(
-        block.text for block in content if isinstance(block, TextContent)
-    )
+    return "\n".join(block.text for block in content if isinstance(block, TextContent))
 
 
 def _truncate(text: str, max_lines: int, max_chars: int) -> str:

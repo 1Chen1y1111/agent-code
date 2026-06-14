@@ -49,6 +49,7 @@ class CliTests(unittest.TestCase):
             patch("sys.argv", ["agentcode"]),
             patch("agentcode.cli.load", return_value=config),
             patch("agentcode.cli.load_prompt_resources", return_value=prompt_resources),
+            patch("agentcode.cli.load_mcp_server_configs", return_value=("mcp",)),
             patch("agentcode.cli.create_default_registry", return_value="registry"),
             patch("agentcode.cli.TerminalApp", return_value=app) as app_cls,
         ):
@@ -58,6 +59,7 @@ class CliTests(unittest.TestCase):
             config.providers,
             "registry",
             prompt_resources.prompt_options,
+            mcp_configs=("mcp",),
         )
         app.run.assert_called_once_with()
 

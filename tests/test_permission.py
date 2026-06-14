@@ -192,4 +192,49 @@ def test_permission_modes_only_allow_or_ask() -> None:
     assert mode_fallback("write", "acceptEdits") == "allow"
     assert mode_fallback("bash", "acceptEdits") == "ask"
     assert mode_fallback("bash", "bypassPermissions") == "allow"
+    assert mode_fallback("mcp__github__get_issue", "default", "readonly") == "allow"
+    assert mode_fallback("mcp__github__create_issue", "default", "command") == "ask"
     assert next_permission_mode("bypassPermissions") == "default"
+
+
+def test_mcp_tool_rules_match_real_names_and_globs(tmp_path: Path) -> None:
+    """权限规则可直接使用 MCP 命名空间工具名和工具名 glob。"""
+
+    local = tmp_path / "local.yaml"
+    local.write_text(
+        """
+allow:
+  - mcp__github__get_issue
+deny:
+  - mcp__github__delete_*
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    policy = PermissionPolicy(
+        tmp_path,
+        load_permission_config(
+            tmp_path,
+            user_path=tmp_path / "missing-user.yaml",
+            project_path=tmp_path / "missing-project.yaml",
+            local_path=local,
+        ),
+    )
+
+    allow_check = policy.evaluate(
+        "mcp__github__get_issue",
+        {},
+        "default",
+        category_override="command",
+    )
+    deny_check = policy.evaluate(
+        "mcp__github__delete_issue",
+        {},
+        "bypassPermissions",
+        category_override="command",
+    )
+
+    assert allow_check.verdict == "allow"
+    assert allow_check.source == "rule"
+    assert deny_check.verdict == "deny"
+    assert deny_check.source == "rule"
