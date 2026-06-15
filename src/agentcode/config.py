@@ -48,9 +48,22 @@ class ContextConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryConfig:
+    """跨进程记忆配置，控制会话存档、自动笔记和保留周期。"""
+
+    enabled: bool = True
+    session_dir: str | None = None
+    notes_dir: str | None = None
+    retention_days: int = 30
+    auto_notes: bool = True
+    note_max_tokens: int = 1_000
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
     context: ContextConfig = field(default_factory=ContextConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -78,7 +91,11 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     providers = [
         _parse_provider(provider, index) for index, provider in enumerate(providers_raw)
     ]
-    return Config(providers=providers, context=_parse_context(raw_config.get("context")))
+    return Config(
+        providers=providers,
+        context=_parse_context(raw_config.get("context")),
+        memory=_parse_memory(raw_config.get("memory")),
+    )
 
 
 def _parse_provider(raw_provider: Any, index: int) -> ProviderConfig:
@@ -174,6 +191,42 @@ def _parse_context(raw_context: Any) -> ContextConfig:
         ),
         artifact_root=artifact_root.strip() if isinstance(artifact_root, str) else None,
     )
+
+
+def _parse_memory(raw_memory: Any) -> MemoryConfig:
+    """校验顶层 memory 配置，并填补默认值。"""
+
+    if raw_memory is None:
+        return MemoryConfig()
+    if not isinstance(raw_memory, dict):
+        raise ConfigError("memory 必须是 YAML 对象或省略")
+
+    prefix = "memory"
+    session_dir = _optional_non_empty_string(raw_memory, "session_dir", prefix)
+    notes_dir = _optional_non_empty_string(raw_memory, "notes_dir", prefix)
+    return MemoryConfig(
+        enabled=_optional_bool(raw_memory, "enabled", prefix, True),
+        session_dir=session_dir,
+        notes_dir=notes_dir,
+        retention_days=_positive_int(raw_memory, "retention_days", prefix, 30),
+        auto_notes=_optional_bool(raw_memory, "auto_notes", prefix, True),
+        note_max_tokens=_positive_int(raw_memory, "note_max_tokens", prefix, 1_000),
+    )
+
+
+def _optional_non_empty_string(
+    raw: dict[str, Any],
+    field_name: str,
+    prefix: str,
+) -> str | None:
+    """读取可选非空字符串字段，省略时返回 None。"""
+
+    value = raw.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{prefix}.{field_name} 必须是非空字符串或省略")
+    return value.strip()
 
 
 def _required_string(raw_provider: dict[str, Any], field_name: str, prefix: str) -> str:

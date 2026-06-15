@@ -12,3 +12,11 @@ providers:
     base_url: https://api.openai.com/v1
     api_key: replace-with-your-openai-api-key
     thinking: false
+
+memory:
+  enabled: true
+  session_dir: .agentcode/sessions
+  notes_dir: .agentcode/memory
+  retention_days: 30
+  auto_notes: true
+  note_max_tokens: 1000

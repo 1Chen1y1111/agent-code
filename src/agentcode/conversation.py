@@ -95,6 +95,13 @@ class Conversation:
             message for message in messages if message not in self._archive
         )
 
+    def restore(self, messages: list[Message]) -> None:
+        """用持久化会话恢复 active 和 archive 历史。"""
+
+        restored = list(messages)
+        self._messages = restored
+        self._archive = list(restored)
+
     def messages(self) -> list[Message]:
         """返回模型可见 active 历史副本。"""
 

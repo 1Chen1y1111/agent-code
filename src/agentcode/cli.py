@@ -48,6 +48,7 @@ def main() -> None:
         mcp_configs=mcp_configs,
         context_settings=_context_settings(config.context),
         project_root=project_root,
+        memory_config=config.memory,
     ).run()
 
 

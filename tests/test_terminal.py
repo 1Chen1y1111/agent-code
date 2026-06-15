@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from rich.console import Console
 
-from agentcode.config import ProviderConfig
+from agentcode.config import MemoryConfig, ProviderConfig
 from agentcode.context import ContextSettings
 from agentcode.llm import (
     AssistantContent,
@@ -23,6 +23,7 @@ from agentcode.llm import (
     TextDeltaEvent,
     ToolCall,
     Usage,
+    message_text,
 )
 from agentcode.permission import PermissionPolicy, load_permission_config
 from agentcode.terminal.app import PROMPT_STYLE, TerminalApp, TerminalRenderer
@@ -464,6 +465,44 @@ async def test_compact_command_runs_manual_compaction(tmp_path: Path) -> None:
     assert "compacted:" in rendered
     assert "摘要" not in rendered
     assert len(provider.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_command_restores_session_history(tmp_path: Path) -> None:
+    """`/resume` 选中历史后，下一轮请求会带上恢复出的消息。"""
+
+    output = io.StringIO()
+    provider = FakeProvider(
+        [
+            _assistant_events(text="ok"),
+            _assistant_events(text="again"),
+        ]
+    )
+    prompt = FakePrompt(["hi", "/resume", "1", "next", "/exit"])
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        Registry(),
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+        project_root=tmp_path,
+        memory_config=MemoryConfig(
+            session_dir=str(tmp_path / "sessions"),
+            notes_dir=str(tmp_path / "notes"),
+            auto_notes=False,
+        ),
+    )
+
+    await app.run_async()
+
+    assert "已恢复会话" in output.getvalue()
+    assert prompt.prompts == ["❯ ", "❯ ", "resume> ", "❯ ", "❯ "]
+    assert [message_text(message) for message in provider.requests[1].messages] == [
+        "hi",
+        "ok",
+        "next",
+    ]
 
 
 class FakePrompt:

@@ -21,9 +21,10 @@ from rich.console import Console
 from rich.status import Status
 
 from agentcode import __version__
-from agentcode.config import ProviderConfig
+from agentcode.config import MemoryConfig, ProviderConfig
 from agentcode.context import ContextSettings
-from agentcode.llm import Provider, create_provider, message_text
+from agentcode.llm import Message, Provider, create_provider, message_text
+from agentcode.memory import MemoryExtractor, MemoryStore
 from agentcode.mcp import McpManager, McpServerConfig
 from agentcode.permission import (
     PermissionApproval,
@@ -33,6 +34,7 @@ from agentcode.permission import (
 )
 from agentcode.prompt import PromptBuildOptions, render_banner
 from agentcode.session import AgentSession, SessionEvent
+from agentcode.session_store import SessionStore, StoredSessionInfo
 from agentcode.tool import Registry, create_default_registry
 from agentcode.terminal.view import (
     assistant_markdown,
@@ -53,6 +55,7 @@ EXIT_COMMANDS = {"/exit", "/quit"}
 PLAN_COMMAND = "/plan"
 DO_COMMAND = "/do"
 COMPACT_COMMAND = "/compact"
+RESUME_COMMAND = "/resume"
 DO_PROMPT = "按计划执行。"
 PROMPT_TEXT = "❯ "
 PROMPT_STYLE = Style.from_dict(
@@ -90,6 +93,7 @@ class TerminalApp:
         permission_policy: PermissionPolicy | None = None,
         context_settings: ContextSettings | None = None,
         project_root: str | Path | None = None,
+        memory_config: MemoryConfig | None = None,
     ) -> None:
         """保存启动依赖；真实 provider 和 session 会在用户选定后创建。"""
 
@@ -113,6 +117,10 @@ class TerminalApp:
             self._project_root
         )
         self._context_settings = context_settings
+        self._memory_config = memory_config
+        self._session_store: SessionStore | None = None
+        self._memory_store: MemoryStore | None = None
+        self._memory_extractor: MemoryExtractor | None = None
         self._permission_mode = self._permission_policy.default_mode()
         self._key_bindings = self._build_key_bindings()
         self.provider: Provider | None = None
@@ -148,16 +156,9 @@ class TerminalApp:
                 return
 
             self.provider = self._provider_factory(provider_config)
-            self.agent_session = AgentSession(
-                self.provider,
-                self._registry,
-                self._prompt_options,
-                permission_policy=self._permission_policy,
-                permission_mode=lambda: self._permission_mode,
-                permission_approver=self._approve_permission,
-                context_settings=self._context_settings,
-                project_root=self._project_root,
-            )
+            self._initialize_memory_runtime()
+            session_id = self._create_stored_session()
+            self.agent_session = self._create_agent_session(session_id=session_id)
 
             while True:
                 try:
@@ -184,6 +185,9 @@ class TerminalApp:
                 if message == DO_COMMAND:
                     self._permission_mode = "default"
                     await self._run_turn(DO_PROMPT)
+                    continue
+                if message == RESUME_COMMAND:
+                    await self._run_resume()
                     continue
                 if message == COMPACT_COMMAND or message.startswith(
                     f"{COMPACT_COMMAND} "
@@ -235,6 +239,59 @@ class TerminalApp:
         if 1 <= index <= len(self.providers):
             return self.providers[index - 1]
         return None
+
+    def _initialize_memory_runtime(self) -> None:
+        """按配置初始化会话存档和自动笔记运行时。"""
+
+        config = self._memory_config
+        if config is None or not config.enabled:
+            return
+        session_dir = config.session_dir or ".agentcode/sessions"
+        notes_dir = config.notes_dir or ".agentcode/memory"
+        self._session_store = SessionStore(session_dir, project_root=self._project_root)
+        self._session_store.cleanup_expired(config.retention_days)
+        self._memory_store = MemoryStore(notes_dir, project_root=self._project_root)
+        self._memory_extractor = MemoryExtractor(max_tokens=config.note_max_tokens)
+
+    def _create_stored_session(self) -> str | None:
+        """创建本次运行的 JSONL session，未启用存档时返回 None。"""
+
+        if self._session_store is None or self.provider is None:
+            return None
+        return self._session_store.create(
+            provider=self.provider.name,
+            model=self.provider.model,
+        )
+
+    def _create_agent_session(
+        self,
+        *,
+        session_id: str | None,
+        initial_messages: list[Message] | None = None,
+    ) -> AgentSession:
+        """创建绑定当前 provider 和运行时依赖的 AgentSession。"""
+
+        if self.provider is None:
+            raise RuntimeError("provider 未初始化")
+        return AgentSession(
+            self.provider,
+            self._registry,
+            self._prompt_options,
+            permission_policy=self._permission_policy,
+            permission_mode=lambda: self._permission_mode,
+            permission_approver=self._approve_permission,
+            context_settings=self._context_settings,
+            project_root=self._project_root,
+            session_id=session_id,
+            session_store=self._session_store,
+            memory_store=self._memory_store,
+            memory_extractor=self._memory_extractor,
+            auto_notes=(
+                bool(self._memory_config and self._memory_config.auto_notes)
+                and self._memory_store is not None
+            ),
+            initial_messages=initial_messages,
+        )
 
     def _bottom_toolbar(self) -> str:
         """生成 prompt_toolkit 底部状态栏文本，显示当前权限模式和模型。"""
@@ -330,6 +387,61 @@ class TerminalApp:
             end="",
         )
 
+    async def _run_resume(self) -> None:
+        """打开会话选择器并把当前 AgentSession 替换为选中的历史会话。"""
+
+        if self._session_store is None:
+            self._console.print("未启用会话存档，无法恢复历史。\n", style="dim")
+            return
+        sessions = self._session_store.list_sessions(limit=50)
+        if not sessions:
+            self._console.print("没有可恢复的历史会话。\n", style="dim")
+            return
+        selected = await self._select_resume_session(sessions)
+        if selected is None:
+            self._console.print("已取消恢复。\n", style="dim")
+            return
+        loaded = self._session_store.load(selected.session_id)
+        self.agent_session = self._create_agent_session(
+            session_id=loaded.session_id,
+            initial_messages=loaded.messages,
+        )
+        self._console.print(f"已恢复会话 {loaded.session_id}。\n", style="dim")
+
+    async def _select_resume_session(
+        self,
+        sessions: list[StoredSessionInfo],
+    ) -> StoredSessionInfo | None:
+        """用 prompt_toolkit 提供可搜索的会话选择入口。"""
+
+        self._console.print(_resume_list_block(sessions), end="")
+        selection = {"index": 0}
+        bindings = _resume_key_bindings(selection, sessions)
+
+        def toolbar() -> str:
+            """展示当前 resume 选择器提示。"""
+
+            index = min(selection["index"], max(0, len(sessions) - 1))
+            current = sessions[index]
+            return (
+                "\n输入关键词过滤 · ↑/↓ 选择 · Enter 恢复 · Esc 取消 | "
+                f"当前: {current.session_id}"
+            )
+
+        try:
+            raw = await self._prompt_reader.prompt_async(
+                "resume> ",
+                bottom_toolbar=toolbar,
+                style=PROMPT_STYLE,
+                key_bindings=bindings,
+            )
+        except (EOFError, KeyboardInterrupt):
+            return None
+        value = raw.strip()
+        if value == "cancel":
+            return None
+        return _resolve_resume_selection(value, sessions, selection["index"])
+
 
 def _permission_request_block(request: PermissionRequest) -> str:
     """把权限确认请求格式化为终端中的 ASCII 确认块。"""
@@ -416,6 +528,116 @@ def _approval_from_input(raw: str, selected_index: int) -> PermissionApproval:
     if value == "3":
         return "deny_once"
     return "allow_once"
+
+
+def _resume_list_block(sessions: list[StoredSessionInfo]) -> str:
+    """把最近会话列表格式化为 ASCII 块。"""
+
+    lines = ["+-- resume ----------------------------------"]
+    for index, session in enumerate(sessions[:10], start=1):
+        title = session.first_user_message or "(empty)"
+        lines.append(
+            f"| {index:>2}. {session.modified_at:%Y-%m-%d %H:%M} "
+            f"{session.session_id}  {title[:48]}"
+        )
+    if len(sessions) > 10:
+        lines.append(f"| ... 还有 {len(sessions) - 10} 个会话，可输入关键词过滤")
+    lines.append("+-------------------------------------------")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _resume_key_bindings(
+    selection: dict[str, int],
+    sessions: list[StoredSessionInfo],
+) -> KeyBindings:
+    """创建 resume 选择器的方向键、Enter 和取消绑定。"""
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    def _(event: object) -> None:
+        """向上移动 resume 选择器光标。"""
+
+        selection["index"] = max(0, selection["index"] - 1)
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.invalidate()
+
+    @bindings.add("down")
+    def _(event: object) -> None:
+        """向下移动 resume 选择器光标。"""
+
+        selection["index"] = min(len(sessions) - 1, selection["index"] + 1)
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.invalidate()
+
+    @bindings.add("enter")
+    def _(event: object) -> None:
+        """确认当前过滤结果中的选中会话。"""
+
+        app = getattr(event, "app", None)
+        if app is None:
+            return
+        buffer = getattr(app, "current_buffer", None)
+        query = str(getattr(buffer, "text", "") or "")
+        filtered = _filter_resume_sessions(query, sessions)
+        if not filtered:
+            app.exit(result="cancel")
+            return
+        index = min(selection["index"], len(filtered) - 1)
+        app.exit(result=filtered[index].session_id)
+
+    @bindings.add("escape")
+    def _(event: object) -> None:
+        """取消恢复会话。"""
+
+        app = getattr(event, "app", None)
+        if app is not None:
+            app.exit(result="cancel")
+
+    return bindings
+
+
+def _resolve_resume_selection(
+    value: str,
+    sessions: list[StoredSessionInfo],
+    selected_index: int,
+) -> StoredSessionInfo | None:
+    """把 resume prompt 返回值解析成会话。"""
+
+    if not value:
+        if not sessions:
+            return None
+        return sessions[min(selected_index, len(sessions) - 1)]
+    for session in sessions:
+        if session.session_id == value:
+            return session
+    if value.isdigit():
+        index = int(value) - 1
+        if 0 <= index < len(sessions):
+            return sessions[index]
+    filtered = _filter_resume_sessions(value, sessions)
+    return filtered[0] if filtered else None
+
+
+def _filter_resume_sessions(
+    query: str,
+    sessions: list[StoredSessionInfo],
+) -> list[StoredSessionInfo]:
+    """按 session id、模型和首条用户消息做简单过滤。"""
+
+    text = query.strip().casefold()
+    if not text:
+        return sessions
+    return [
+        session
+        for session in sessions
+        if text in session.session_id.casefold()
+        or text in session.model.casefold()
+        or text in session.first_user_message.casefold()
+    ]
 
 
 class TerminalRenderer:

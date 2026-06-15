@@ -6,6 +6,7 @@ from agentcode.prompt import (
     PET_BANNER,
     PromptBuildOptions,
     PromptContextFile,
+    PromptMemoryNote,
     PromptModule,
     SupplementalInstruction,
     build_system_prompt,
@@ -44,6 +45,24 @@ def test_build_system_prompt_adds_context_and_guidelines() -> None:
     assert '<project_instructions path="AGENTS.md">' in prompt
     assert "中文回答" in prompt
     assert f"Current date: {date.today().isoformat()}" in prompt
+
+
+def test_build_system_prompt_adds_memory_notes() -> None:
+    prompt = build_system_prompt(
+        PromptBuildOptions(
+            memory_notes=[
+                PromptMemoryNote(
+                    category="project",
+                    content="使用中文注释",
+                    source="20260615-120000-abcd",
+                )
+            ]
+        )
+    )
+
+    assert "<agentcode_memory>" in prompt
+    assert 'category="project"' in prompt
+    assert "使用中文注释" in prompt
 
 
 def test_runtime_environment_instruction_is_supplemental() -> None:

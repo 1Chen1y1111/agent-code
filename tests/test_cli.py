@@ -64,6 +64,7 @@ class CliTests(unittest.TestCase):
             mcp_configs=("mcp",),
             context_settings=ContextSettings(),
             project_root=Path.cwd(),
+            memory_config=config.memory,
         )
         app.run.assert_called_once_with()
 

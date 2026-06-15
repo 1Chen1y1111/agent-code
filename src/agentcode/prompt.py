@@ -33,6 +33,15 @@ class PromptContextFile:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptMemoryNote:
+    """可注入提示词的持久化记忆笔记。"""
+
+    category: str
+    content: str
+    source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class PromptSkill:
     """可展示给模型的技能说明，当前只负责进入提示词索引。"""
 
@@ -63,6 +72,7 @@ class PromptBuildOptions:
     append_system_prompt: str | None = None
     cwd: str | None = None
     context_files: Sequence[PromptContextFile] = field(default_factory=tuple)
+    memory_notes: Sequence[PromptMemoryNote] = field(default_factory=tuple)
     skills: Sequence[PromptSkill] = field(default_factory=tuple)
     modules: Sequence[PromptModule] | None = None
 
@@ -133,6 +143,10 @@ def build_system_prompt(options: PromptBuildOptions | None = None) -> str:
     project_context = _project_context_section(opts.context_files)
     if project_context:
         prompt = f"{prompt}\n\n{project_context}"
+
+    memory_context = _memory_section(opts.memory_notes)
+    if memory_context:
+        prompt = f"{prompt}\n\n{memory_context}"
 
     skills = _skills_section(opts.skills)
     if skills:
@@ -260,6 +274,29 @@ def _project_context_section(context_files: Sequence[PromptContextFile]) -> str:
         )
     blocks.append("</project_context>")
     return "\n\n".join(blocks)
+
+
+def _memory_section(notes: Sequence[PromptMemoryNote]) -> str:
+    """把持久化记忆笔记格式化为独立上下文块。"""
+
+    visible = [note for note in notes if note.content.strip()]
+    if not visible:
+        return ""
+    lines = [
+        "<agentcode_memory>",
+        "Relevant persisted notes from previous sessions:",
+    ]
+    for note in visible:
+        category = _escape_attr(note.category or "work")
+        source = _escape_attr(note.source)
+        source_attr = f' source="{source}"' if source else ""
+        lines.append(
+            f'<memory_note category="{category}"{source_attr}>'
+            f"{_escape_text(note.content.strip())}"
+            "</memory_note>"
+        )
+    lines.append("</agentcode_memory>")
+    return "\n".join(lines)
 
 
 def _skills_section(skills: Sequence[PromptSkill]) -> str:

@@ -33,6 +33,13 @@ context:
   keep_recent_tokens: 2000
   summary_max_tokens: 3000
   artifact_root: /tmp/agentcode-artifacts
+memory:
+  enabled: true
+  session_dir: .agentcode/sessions
+  notes_dir: .agentcode/memory
+  retention_days: 7
+  auto_notes: false
+  note_max_tokens: 321
 """)
         )
 
@@ -50,6 +57,12 @@ context:
         self.assertEqual(config.context.keep_recent_tokens, 2000)
         self.assertEqual(config.context.summary_max_tokens, 3000)
         self.assertEqual(config.context.artifact_root, "/tmp/agentcode-artifacts")
+        self.assertTrue(config.memory.enabled)
+        self.assertEqual(config.memory.session_dir, ".agentcode/sessions")
+        self.assertEqual(config.memory.notes_dir, ".agentcode/memory")
+        self.assertEqual(config.memory.retention_days, 7)
+        self.assertFalse(config.memory.auto_notes)
+        self.assertEqual(config.memory.note_max_tokens, 321)
 
     def test_invalid_context_value_is_error(self) -> None:
         path = self._write_config("""
@@ -63,6 +76,20 @@ context:
 """)
 
         with self.assertRaisesRegex(ConfigError, "context.reserve_tokens"):
+            load(path)
+
+    def test_invalid_memory_value_is_error(self) -> None:
+        path = self._write_config("""
+providers:
+  - name: OpenAI
+    protocol: openai
+    model: gpt-4o
+    api_key: sk-openai-test
+memory:
+  retention_days: 0
+""")
+
+        with self.assertRaisesRegex(ConfigError, "memory.retention_days"):
             load(path)
 
     def test_missing_provider_field_is_error(self) -> None:

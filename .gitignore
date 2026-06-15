@@ -1,6 +1,8 @@
 .agentcode/config.yaml
 .agentcode/permissions.local.yaml
 .agentcode/context-artifacts/
+.agentcode/sessions/
+.agentcode/memory/
 __pycache__/
 *.py[cod]
 .DS_Store
