@@ -81,6 +81,12 @@ class AnthropicProvider:
 
         return self._cfg.model
 
+    @property
+    def context_window(self) -> int | None:
+        """返回用户配置的模型上下文窗口，缺省时交给上层使用协议默认值。"""
+
+        return self._cfg.context_window
+
     async def stream(
         self, context: Context, options: StreamOptions | None = None
     ) -> AsyncIterator[AssistantMessageEvent]:

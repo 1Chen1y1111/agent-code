@@ -3,10 +3,12 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agentcode.cli import main
 from agentcode.config import Config, ConfigError, ProviderConfig
+from agentcode.context import ContextSettings
 from agentcode.prompt import PromptBuildOptions
 
 
@@ -60,6 +62,8 @@ class CliTests(unittest.TestCase):
             "registry",
             prompt_resources.prompt_options,
             mcp_configs=("mcp",),
+            context_settings=ContextSettings(),
+            project_root=Path.cwd(),
         )
         app.run.assert_called_once_with()
 

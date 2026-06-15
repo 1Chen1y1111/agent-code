@@ -410,6 +410,11 @@ class Provider(Protocol):
         """返回当前 provider 配置的模型标识。"""
         ...
 
+    @property
+    def context_window(self) -> int | None:
+        """返回配置声明的上下文窗口；未知时由上下文管理模块使用协议默认值。"""
+        ...
+
     def stream(
         self, context: Context, options: StreamOptions | None = None
     ) -> AsyncIterator[AssistantMessageEvent]:

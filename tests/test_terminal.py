@@ -9,6 +9,7 @@ import pytest
 from rich.console import Console
 
 from agentcode.config import ProviderConfig
+from agentcode.context import ContextSettings
 from agentcode.llm import (
     AssistantContent,
     AssistantMessage,
@@ -434,6 +435,37 @@ async def test_plan_and_do_commands_switch_modes(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_compact_command_runs_manual_compaction(tmp_path: Path) -> None:
+    """`/compact` 使用当前会话历史生成摘要并输出压缩结果。"""
+
+    output = io.StringIO()
+    provider = FakeProvider(
+        [
+            _assistant_events(text="ok"),
+            _assistant_events(text="摘要"),
+        ]
+    )
+    prompt = FakePrompt(["hi", "/compact focus", "/exit"])
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        Registry(),
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+        context_settings=ContextSettings(keep_recent_tokens=1, artifact_root=tmp_path),
+    )
+
+    await app.run_async()
+
+    rendered = output.getvalue()
+    assert "compacting: manual" in rendered
+    assert "compacted:" in rendered
+    assert "摘要" not in rendered
+    assert len(provider.requests) == 2
+
+
 class FakePrompt:
     """测试用 prompt_reader，按脚本返回输入或抛出异常。"""
 
@@ -471,6 +503,7 @@ class FakeProvider:
         self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
+        self.context_window = 100_000
         self._scripts = scripts
         self.requests: list[Context] = []
         self.stream_options: list[StreamOptions | None] = []

@@ -9,7 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from agentcode.config import ConfigError, load
+from agentcode.config import ConfigError, ContextConfig, load
+from agentcode.context import ContextSettings
 from agentcode.mcp import load_mcp_server_configs
 from agentcode.resource_loader import load_prompt_resources
 from agentcode.terminal import TerminalApp
@@ -37,11 +38,30 @@ def main() -> None:
         print(f"配置错误：{exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    prompt_resources = load_prompt_resources(Path.cwd())
-    mcp_configs = load_mcp_server_configs(Path.cwd())
+    project_root = Path.cwd()
+    prompt_resources = load_prompt_resources(project_root)
+    mcp_configs = load_mcp_server_configs(project_root)
     TerminalApp(
         config.providers,
         create_default_registry(),
         prompt_resources.prompt_options,
         mcp_configs=mcp_configs,
+        context_settings=_context_settings(config.context),
+        project_root=project_root,
     ).run()
+
+
+def _context_settings(config: ContextConfig) -> ContextSettings:
+    """把配置层 context 字段转换为运行期上下文治理设置。"""
+
+    return ContextSettings(
+        enabled=config.enabled,
+        externalize_tool_results=config.externalize_tool_results,
+        max_inline_tool_result_chars=config.max_inline_tool_result_chars,
+        max_inline_tool_result_lines=config.max_inline_tool_result_lines,
+        tool_result_preview_chars=config.tool_result_preview_chars,
+        reserve_tokens=config.reserve_tokens,
+        keep_recent_tokens=config.keep_recent_tokens,
+        summary_max_tokens=config.summary_max_tokens,
+        artifact_root=Path(config.artifact_root) if config.artifact_root else None,
+    )

@@ -12,6 +12,7 @@ from agentcode.agent import (
     Agent,
     AgentRunOptions,
 )
+from agentcode.context import ContextManager, ContextSettings
 from agentcode.conversation import Conversation
 from agentcode.llm import (
     AssistantContent,
@@ -20,6 +21,7 @@ from agentcode.llm import (
     Context,
     DoneEvent,
     DoneStopReason,
+    ErrorEvent,
     StartEvent,
     StreamOptions,
     TextContent,
@@ -555,6 +557,55 @@ async def test_plan_mode_exposes_dynamic_readonly_tools() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_and_retries_once(tmp_path) -> None:
+    """provider 报上下文溢出时会压缩历史并自动重试当前请求。"""
+
+    conv = Conversation()
+    conv.add_user("旧需求")
+    conv.add_assistant("旧回答")
+    conv.add_user("继续")
+    overflow_message = AssistantMessage(
+        stop_reason="error",
+        error_message="context_length_exceeded: too long",
+        provider="Fake",
+        model="fake-model",
+    )
+    provider = FakeProvider(
+        [
+            [
+                StartEvent(partial=AssistantMessage()),
+                ErrorEvent(reason="error", error=overflow_message),
+            ],
+            _assistant_events(text="压缩摘要"),
+            _assistant_events(text="恢复成功"),
+        ]
+    )
+    manager = ContextManager(
+        ContextSettings(
+            keep_recent_tokens=1,
+            artifact_root=tmp_path,
+        ),
+        session_id="test",
+    )
+
+    events = [
+        event
+        async for event in Agent(provider, RecordingRegistry()).run(
+            conv,
+            AgentRunOptions(context_manager=manager),
+        )
+    ]
+
+    compaction_events = [event for event in events if event.type == "compaction_end"]
+    assert len(compaction_events) == 1
+    assert compaction_events[0].compaction_reason == "overflow"
+    assert compaction_events[0].will_retry is True
+    assert len(provider.requests) == 3
+    assert "压缩摘要" in message_text(provider.requests[-1].messages[0])
+    assert message_text(conv.messages()[-1]) == "恢复成功"
+
+
 async def _collect(stream: AsyncIterator[object]) -> list[object]:
     events: list[object] = []
     async for event in stream:
@@ -567,6 +618,7 @@ class FakeProvider:
         self.api = "fake"
         self.name = "Fake"
         self.model = "fake-model"
+        self.context_window = 100_000
         self._scripts = scripts
         self.requests: list[Context] = []
         self.stream_options: list[StreamOptions | None] = []

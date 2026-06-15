@@ -10,6 +10,8 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
+from agentcode.context import CompactionReport
+
 
 def assistant_markdown(text: str) -> RenderableType:
     """渲染 assistant 完整正文的 Markdown。"""
@@ -45,6 +47,57 @@ def elapsed_block(seconds: int) -> Text:
     """渲染本回合最终耗时。"""
 
     return Text(f"\n耗时：{seconds}s\n\n", style="dim")
+
+
+def compaction_start_block(reason: str) -> Text:
+    """渲染上下文压缩开始提示。"""
+
+    label = {
+        "manual": "manual",
+        "threshold": "auto threshold",
+        "overflow": "overflow recovery",
+    }.get(reason, reason)
+    return Text(
+        "+-- context ---------------------------------\n"
+        f"| compacting: {label}\n"
+        "+--------------------------------------------\n\n",
+        style="dim",
+    )
+
+
+def compaction_end_block(
+    reason: str,
+    report: CompactionReport | None,
+    *,
+    will_retry: bool = False,
+    error_message: str = "",
+) -> Text:
+    """渲染上下文压缩结束提示。"""
+
+    if report is None:
+        message = error_message or "no compactable history"
+        return Text(
+            "+-- context ---------------------------------\n"
+            f"| compaction skipped: {message}\n"
+            "+--------------------------------------------\n\n",
+            style="bold red",
+        )
+
+    retry_line = "| retry: once after compaction\n" if will_retry else ""
+    artifact_line = (
+        f"| artifacts kept: {len(report.artifacts)}\n" if report.artifacts else ""
+    )
+    return Text(
+        "+-- context ---------------------------------\n"
+        f"| compacted: {report.summarized_messages} messages summarized\n"
+        f"| kept: {report.kept_messages} recent messages\n"
+        f"| tokens before: {report.tokens_before}\n"
+        f"{artifact_line}"
+        f"{retry_line}"
+        f"| reason: {reason}\n"
+        "+--------------------------------------------\n\n",
+        style="dim",
+    )
 
 
 def provider_option(index: int, name: str, model: str) -> Text:

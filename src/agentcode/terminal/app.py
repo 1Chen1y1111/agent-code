@@ -22,6 +22,7 @@ from rich.status import Status
 
 from agentcode import __version__
 from agentcode.config import ProviderConfig
+from agentcode.context import ContextSettings
 from agentcode.llm import Provider, create_provider, message_text
 from agentcode.mcp import McpManager, McpServerConfig
 from agentcode.permission import (
@@ -36,6 +37,8 @@ from agentcode.tool import Registry, create_default_registry
 from agentcode.terminal.view import (
     assistant_markdown,
     assistant_text_delta,
+    compaction_end_block,
+    compaction_start_block,
     elapsed_block,
     error_block,
     provider_option,
@@ -49,6 +52,7 @@ from agentcode.terminal.view import (
 EXIT_COMMANDS = {"/exit", "/quit"}
 PLAN_COMMAND = "/plan"
 DO_COMMAND = "/do"
+COMPACT_COMMAND = "/compact"
 DO_PROMPT = "按计划执行。"
 PROMPT_TEXT = "❯ "
 PROMPT_STYLE = Style.from_dict(
@@ -84,9 +88,12 @@ class TerminalApp:
         ] = McpManager,
         clock: Callable[[], float] = time.monotonic,
         permission_policy: PermissionPolicy | None = None,
+        context_settings: ContextSettings | None = None,
+        project_root: str | Path | None = None,
     ) -> None:
         """保存启动依赖；真实 provider 和 session 会在用户选定后创建。"""
 
+        self._project_root = Path(project_root or Path.cwd()).resolve()
         self.providers = providers
         self._registry = registry or create_default_registry()
         self._prompt_options = prompt_options or PromptBuildOptions()
@@ -102,7 +109,10 @@ class TerminalApp:
         self._mcp_configs = tuple(mcp_configs)
         self._mcp_manager_factory = mcp_manager_factory
         self._clock = clock
-        self._permission_policy = permission_policy or PermissionPolicy.load(Path.cwd())
+        self._permission_policy = permission_policy or PermissionPolicy.load(
+            self._project_root
+        )
+        self._context_settings = context_settings
         self._permission_mode = self._permission_policy.default_mode()
         self._key_bindings = self._build_key_bindings()
         self.provider: Provider | None = None
@@ -130,7 +140,7 @@ class TerminalApp:
                 mcp_tool_count = await mcp_manager.start()
 
             self._console.print(
-                render_banner(__version__, str(Path.cwd()), mcp_tool_count),
+                render_banner(__version__, str(self._project_root), mcp_tool_count),
                 end="",
             )
             provider_config = await self._select_provider_config()
@@ -145,6 +155,8 @@ class TerminalApp:
                 permission_policy=self._permission_policy,
                 permission_mode=lambda: self._permission_mode,
                 permission_approver=self._approve_permission,
+                context_settings=self._context_settings,
+                project_root=self._project_root,
             )
 
             while True:
@@ -172,6 +184,14 @@ class TerminalApp:
                 if message == DO_COMMAND:
                     self._permission_mode = "default"
                     await self._run_turn(DO_PROMPT)
+                    continue
+                if message == COMPACT_COMMAND or message.startswith(
+                    f"{COMPACT_COMMAND} "
+                ):
+                    custom_instructions = (
+                        message[len(COMPACT_COMMAND) :].strip() or None
+                    )
+                    await self._run_compact(custom_instructions)
                     continue
                 await self._run_turn(message)
         finally:
@@ -291,6 +311,24 @@ class TerminalApp:
             self._console.print(error_block(exc), end="")
         finally:
             self._renderer.stop_status()
+
+    async def _run_compact(self, custom_instructions: str | None = None) -> None:
+        """执行手动上下文压缩命令并把结果追加到终端。"""
+
+        if self.agent_session is None:
+            return
+
+        self._renderer.stop_status()
+        self._console.print(compaction_start_block("manual"), end="")
+        try:
+            report = await self.agent_session.compact(custom_instructions)
+        except Exception as exc:  # noqa: BLE001 - 手动命令错误需要恢复终端并展示。
+            self._console.print(error_block(exc), end="")
+            return
+        self._console.print(
+            compaction_end_block("manual", report),
+            end="",
+        )
 
 
 def _permission_request_block(request: PermissionRequest) -> str:
@@ -425,6 +463,27 @@ class TerminalRenderer:
             return
         if event.type == "tool_execution_end":
             self._handle_tool_end(event)
+            return
+        if event.type == "compaction_start":
+            self.stop_status()
+            self._ensure_block_gap()
+            self._console.print(
+                compaction_start_block(event.compaction_reason or "threshold"),
+                end="",
+            )
+            return
+        if event.type == "compaction_end":
+            self.stop_status()
+            self._ensure_block_gap()
+            self._console.print(
+                compaction_end_block(
+                    event.compaction_reason or "threshold",
+                    event.compaction,
+                    will_retry=event.will_retry,
+                    error_message=event.error_message,
+                ),
+                end="",
+            )
             return
         if event.type == "error" and event.err is not None:
             self.stop_status()

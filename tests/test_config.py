@@ -18,10 +18,21 @@ providers:
     base_url: https://api.anthropic.com
     api_key: sk-ant-test
     thinking: true
+    context_window: 200000
   - name: OpenAI
     protocol: openai
     model: gpt-4o
     api_key: sk-openai-test
+context:
+  enabled: true
+  externalize_tool_results: false
+  max_inline_tool_result_chars: 1234
+  max_inline_tool_result_lines: 56
+  tool_result_preview_chars: 789
+  reserve_tokens: 1000
+  keep_recent_tokens: 2000
+  summary_max_tokens: 3000
+  artifact_root: /tmp/agentcode-artifacts
 """)
         )
 
@@ -29,7 +40,30 @@ providers:
         self.assertEqual(config.providers[0].name, "Claude")
         self.assertEqual(config.providers[0].protocol, "anthropic")
         self.assertTrue(config.providers[0].thinking)
+        self.assertEqual(config.providers[0].context_window, 200000)
         self.assertIsNone(config.providers[1].base_url)
+        self.assertFalse(config.context.externalize_tool_results)
+        self.assertEqual(config.context.max_inline_tool_result_chars, 1234)
+        self.assertEqual(config.context.max_inline_tool_result_lines, 56)
+        self.assertEqual(config.context.tool_result_preview_chars, 789)
+        self.assertEqual(config.context.reserve_tokens, 1000)
+        self.assertEqual(config.context.keep_recent_tokens, 2000)
+        self.assertEqual(config.context.summary_max_tokens, 3000)
+        self.assertEqual(config.context.artifact_root, "/tmp/agentcode-artifacts")
+
+    def test_invalid_context_value_is_error(self) -> None:
+        path = self._write_config("""
+providers:
+  - name: OpenAI
+    protocol: openai
+    model: gpt-4o
+    api_key: sk-openai-test
+context:
+  reserve_tokens: 0
+""")
+
+        with self.assertRaisesRegex(ConfigError, "context.reserve_tokens"):
+            load(path)
 
     def test_missing_provider_field_is_error(self) -> None:
         path = self._write_config("""

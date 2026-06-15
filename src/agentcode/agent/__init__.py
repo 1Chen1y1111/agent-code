@@ -14,6 +14,11 @@ import json
 from pathlib import Path
 from typing import Literal
 
+from agentcode.context import (
+    CompactionReport,
+    ContextManager,
+    is_context_overflow,
+)
 from agentcode.conversation import Conversation
 from agentcode.llm import (
     AssistantMessage,
@@ -77,6 +82,8 @@ EventType = Literal[
     "agent_end",
     "progress",
     "usage",
+    "compaction_start",
+    "compaction_end",
     "error",
 ]
 StopReason = Literal[
@@ -103,6 +110,7 @@ class AgentRunOptions:
     permission_mode: PermissionMode = "default"
     permission_approver: PermissionApprover | None = None
     visible_tool_names: tuple[str, ...] | None = None
+    context_manager: ContextManager | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +130,10 @@ class AgentEvent:
     progress: str = ""
     stop_reason: StopReason | None = None
     err: Exception | None = None
+    compaction_reason: Literal["manual", "threshold", "overflow"] | None = None
+    compaction: CompactionReport | None = None
+    will_retry: bool = False
+    error_message: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +164,7 @@ class Agent:
         run_options = options or AgentRunOptions()
         unknown_tool_turns = 0
         iteration = 0
+        overflow_recovery_attempted = False
 
         try:
             while True:
@@ -183,10 +196,38 @@ class Agent:
                     run_options.prompt_options,
                     run_options.supplemental_instructions,
                 )
+                if (
+                    run_options.context_manager is not None
+                    and run_options.context_manager.should_compact(
+                        context,
+                        self._provider,
+                    )
+                ):
+                    yield AgentEvent(
+                        type="compaction_start",
+                        compaction_reason="threshold",
+                    )
+                    compaction = await run_options.context_manager.compact_conversation(
+                        conv,
+                        self._provider,
+                        tools,
+                    )
+                    yield AgentEvent(
+                        type="compaction_end",
+                        compaction_reason="threshold",
+                        compaction=compaction,
+                    )
+                    context = _build_context(
+                        conv,
+                        tools,
+                        run_options.prompt_options,
+                        run_options.supplemental_instructions,
+                    )
                 stream_options = StreamOptions(
                     cache_retention=run_options.cache_retention,
                     session_id=run_options.session_id,
                 )
+                retry_after_compaction = False
                 async for stream_event in self._provider.stream(
                     context, stream_options
                 ):
@@ -198,6 +239,42 @@ class Agent:
                         )
                         continue
                     if isinstance(stream_event, ErrorEvent):
+                        if (
+                            run_options.context_manager is not None
+                            and not overflow_recovery_attempted
+                            and is_context_overflow(
+                                stream_event.error,
+                                run_options.context_manager.context_window_for(
+                                    self._provider
+                                ),
+                            )
+                        ):
+                            overflow_recovery_attempted = True
+                            yield AgentEvent(
+                                type="compaction_start",
+                                compaction_reason="overflow",
+                            )
+                            compaction = (
+                                await run_options.context_manager.compact_conversation(
+                                    conv,
+                                    self._provider,
+                                    tools,
+                                )
+                            )
+                            yield AgentEvent(
+                                type="compaction_end",
+                                compaction_reason="overflow",
+                                compaction=compaction,
+                                will_retry=compaction is not None,
+                                error_message=(
+                                    ""
+                                    if compaction is not None
+                                    else "上下文溢出恢复失败：当前历史没有可压缩内容。"
+                                ),
+                            )
+                            if compaction is not None:
+                                retry_after_compaction = True
+                                break
                         yield AgentEvent(
                             type="error",
                             err=stream_event.err,
@@ -217,6 +294,9 @@ class Agent:
                         yield AgentEvent(type="message_update", text=stream_event.delta)
                     if isinstance(stream_event, DoneEvent):
                         assistant_message = stream_event.message
+
+                if retry_after_compaction:
+                    continue
 
                 if not message_started:
                     yield AgentEvent(type="message_start", message=AssistantMessage())
@@ -254,17 +334,37 @@ class Agent:
                     if outcome is not None:
                         outcomes.append(outcome)
 
-                tool_results = [
-                    ToolResultMessage(
-                        tool_call_id=outcome.call.id,
-                        tool_name=outcome.call.name,
-                        content=outcome.result.content,
-                        details=outcome.result.details,
-                        is_error=outcome.result.is_error,
+                tool_results: list[ToolResultMessage] = []
+                archive_tool_results: list[ToolResultMessage] = []
+                for outcome in outcomes:
+                    active_result = outcome.result
+                    archive_result = outcome.result
+                    if run_options.context_manager is not None:
+                        active_result, archive_result = (
+                            run_options.context_manager.externalize_tool_result(
+                                outcome.call,
+                                outcome.result,
+                            )
+                        )
+                    tool_results.append(
+                        ToolResultMessage(
+                            tool_call_id=outcome.call.id,
+                            tool_name=outcome.call.name,
+                            content=active_result.content,
+                            details=active_result.details,
+                            is_error=active_result.is_error,
+                        )
                     )
-                    for outcome in outcomes
-                ]
-                conv.add_tool_results(tool_results)
+                    archive_tool_results.append(
+                        ToolResultMessage(
+                            tool_call_id=outcome.call.id,
+                            tool_name=outcome.call.name,
+                            content=archive_result.content,
+                            details=archive_result.details,
+                            is_error=archive_result.is_error,
+                        )
+                    )
+                conv.add_tool_results(tool_results, archive_tool_results)
                 for tool_message in tool_results:
                     yield AgentEvent(type="message_start", message=tool_message)
                     yield AgentEvent(type="message_end", message=tool_message)
