@@ -505,6 +505,70 @@ async def test_resume_command_restores_session_history(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_local_slash_commands_do_not_call_provider(tmp_path: Path) -> None:
+    """本地查询类斜杠命令只读运行状态，不提交给 LLM。"""
+
+    output = io.StringIO()
+    registry = Registry()
+    registry.register(UpdatingTool())
+    provider = FakeProvider([])
+    prompt = FakePrompt(
+        ["/help", "/session", "/memory", "/permissions", "/tools", "/exit"]
+    )
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        registry,
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+        project_root=tmp_path,
+        memory_config=MemoryConfig(
+            session_dir=str(tmp_path / "sessions"),
+            notes_dir=str(tmp_path / "notes"),
+            auto_notes=False,
+        ),
+    )
+
+    await app.run_async()
+
+    rendered = output.getvalue()
+    assert "可用命令：" in rendered
+    assert "/compact [instructions]" in rendered
+    assert "+-- session" in rendered
+    assert "+-- memory" in rendered
+    assert "+-- permissions" in rendered
+    assert "+-- tools" in rendered
+    assert "| - read" in rendered
+    assert provider.requests == []
+    assert "completer" not in prompt.kwargs[0]
+    assert prompt.kwargs[0]["refresh_interval"] == 0.2
+    assert app._bottom_toolbar_for_text("/he").startswith("\ncommands: /help")
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_is_not_sent_to_provider(tmp_path: Path) -> None:
+    """未知斜杠命令会本地提示，不作为普通用户消息进入模型。"""
+
+    output = io.StringIO()
+    provider = FakeProvider([])
+    prompt = FakePrompt(["/wat", "/exit"])
+    app = TerminalApp(
+        [_provider("Only", "openai")],
+        Registry(),
+        console=_console(output),
+        prompt_reader=prompt,
+        provider_factory=lambda _: provider,
+        permission_policy=_permission_policy(tmp_path),
+    )
+
+    await app.run_async()
+
+    assert "未知命令: /wat" in output.getvalue()
+    assert provider.requests == []
+
+
 class FakePrompt:
     """测试用 prompt_reader，按脚本返回输入或抛出异常。"""
 

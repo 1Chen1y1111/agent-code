@@ -14,11 +14,13 @@ from typing import Protocol, cast
 
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.status import Status
+from rich.text import Text
 
 from agentcode import __version__
 from agentcode.config import MemoryConfig, ProviderConfig
@@ -28,14 +30,17 @@ from agentcode.memory import MemoryExtractor, MemoryStore
 from agentcode.mcp import McpManager, McpServerConfig
 from agentcode.permission import (
     PermissionApproval,
+    PermissionMode,
     PermissionPolicy,
     PermissionRequest,
+    VALID_MODES,
     next_permission_mode,
 )
 from agentcode.prompt import PromptBuildOptions, render_banner
 from agentcode.session import AgentSession, SessionEvent
 from agentcode.session_store import SessionStore, StoredSessionInfo
 from agentcode.tool import Registry, create_default_registry
+from agentcode.terminal.commands import create_builtin_command_registry
 from agentcode.terminal.view import (
     assistant_markdown,
     assistant_text_delta,
@@ -51,12 +56,6 @@ from agentcode.terminal.view import (
     user_block,
 )
 
-EXIT_COMMANDS = {"/exit", "/quit"}
-PLAN_COMMAND = "/plan"
-DO_COMMAND = "/do"
-COMPACT_COMMAND = "/compact"
-RESUME_COMMAND = "/resume"
-DO_PROMPT = "按计划执行。"
 PROMPT_TEXT = "❯ "
 PROMPT_STYLE = Style.from_dict(
     {
@@ -122,6 +121,8 @@ class TerminalApp:
         self._memory_store: MemoryStore | None = None
         self._memory_extractor: MemoryExtractor | None = None
         self._permission_mode = self._permission_policy.default_mode()
+        self._slash_commands = create_builtin_command_registry()
+        self._slash_command_context = _TerminalCommandContext(self)
         self._key_bindings = self._build_key_bindings()
         self.provider: Provider | None = None
         self.agent_session: AgentSession | None = None
@@ -165,6 +166,7 @@ class TerminalApp:
                     raw_text = await self._prompt_reader.prompt_async(
                         PROMPT_TEXT,
                         bottom_toolbar=self._bottom_toolbar,
+                        refresh_interval=0.2,
                         style=PROMPT_STYLE,
                         key_bindings=self._key_bindings,
                     )
@@ -176,26 +178,13 @@ class TerminalApp:
                 message = raw_text.strip()
                 if not message:
                     continue
-                if message in EXIT_COMMANDS:
+                command_outcome = await self._slash_commands.dispatch(
+                    message,
+                    self._slash_command_context,
+                )
+                if command_outcome == "exit":
                     break
-                if message == PLAN_COMMAND:
-                    self._permission_mode = "plan"
-                    self._console.print("已进入 plan 模式。\n", style="dim")
-                    continue
-                if message == DO_COMMAND:
-                    self._permission_mode = "default"
-                    await self._run_turn(DO_PROMPT)
-                    continue
-                if message == RESUME_COMMAND:
-                    await self._run_resume()
-                    continue
-                if message == COMPACT_COMMAND or message.startswith(
-                    f"{COMPACT_COMMAND} "
-                ):
-                    custom_instructions = (
-                        message[len(COMPACT_COMMAND) :].strip() or None
-                    )
-                    await self._run_compact(custom_instructions)
+                if command_outcome == "handled":
                     continue
                 await self._run_turn(message)
         finally:
@@ -296,6 +285,14 @@ class TerminalApp:
     def _bottom_toolbar(self) -> str:
         """生成 prompt_toolkit 底部状态栏文本，显示当前权限模式和模型。"""
 
+        return self._bottom_toolbar_for_text(_current_prompt_text())
+
+    def _bottom_toolbar_for_text(self, text: str) -> str:
+        """根据当前输入生成底部栏文本。"""
+
+        command_toolbar = self._slash_commands.toolbar_text(text)
+        if command_toolbar is not None:
+            return command_toolbar
         if self.provider is None:
             return ""
         return f"\npermission: {self._permission_mode} · model: {self.provider.model}"
@@ -316,12 +313,118 @@ class TerminalApp:
             if app is not None:
                 app.invalidate()
 
+        @bindings.add("tab")
+        def _(event: object) -> None:
+            """处理斜杠命令 Tab 补全。"""
+
+            buffer = getattr(event, "current_buffer", None)
+            if buffer is None:
+                return
+            text = str(getattr(buffer, "text", "") or "")
+            completed = self._slash_commands.complete_text(text)
+            if completed is None:
+                return
+            setattr(buffer, "text", completed)
+            setattr(buffer, "cursor_position", len(completed))
+            app = getattr(event, "app", None)
+            if app is not None:
+                app.invalidate()
+
         return bindings
 
     def _cycle_permission_mode(self) -> None:
         """把当前权限模式切换到循环序列中的下一档。"""
 
         self._permission_mode = next_permission_mode(self._permission_mode)
+
+    def _set_permission_mode(self, mode: PermissionMode) -> None:
+        """把当前权限模式设置为命令指定值。"""
+
+        self._permission_mode = mode
+
+    def _write_command_output(self, text: str, *, style: str | None = None) -> None:
+        """向终端追加本地命令输出。"""
+
+        self._renderer.stop_status()
+        self._console.print(
+            Text(text, style=style or ""),
+            end="" if text.endswith("\n") else "\n",
+        )
+
+    def _session_status_text(self) -> str:
+        """生成 `/session` 的当前会话状态文本。"""
+
+        provider = self.provider
+        session = self.agent_session
+        session_id = session.session_id if session is not None else "(none)"
+        session_file = (
+            str(self._session_store.path_for(session_id))
+            if self._session_store is not None and session is not None
+            else "(disabled)"
+        )
+        provider_name = provider.name if provider is not None else "(none)"
+        model = provider.model if provider is not None else "(none)"
+        message_count = len(session.messages()) if session is not None else 0
+        return (
+            "+-- session ---------------------------------\n"
+            f"| id: {session_id}\n"
+            f"| provider: {provider_name}\n"
+            f"| model: {model}\n"
+            f"| messages: {message_count}\n"
+            f"| archive: {session_file}\n"
+            "+--------------------------------------------\n"
+        )
+
+    def _memory_status_text(self) -> str:
+        """生成 `/memory` 的当前记忆状态文本。"""
+
+        config = self._memory_config
+        enabled = bool(config and config.enabled and self._memory_store is not None)
+        auto_notes = bool(config and config.auto_notes and enabled)
+        notes_count = 0
+        notes_dir = "(disabled)"
+        user_notes_dir = "(disabled)"
+        if self._memory_store is not None:
+            notes_count = len(self._memory_store.load_all())
+            notes_dir = str(self._memory_store.notes_dir)
+            user_notes_dir = str(self._memory_store.user_notes_dir)
+        session_dir = (
+            str(self._session_store.root)
+            if self._session_store is not None
+            else "(disabled)"
+        )
+        return (
+            "+-- memory ----------------------------------\n"
+            f"| enabled: {enabled}\n"
+            f"| auto notes: {auto_notes}\n"
+            f"| notes: {notes_count}\n"
+            f"| notes dir: {notes_dir}\n"
+            f"| user notes dir: {user_notes_dir}\n"
+            f"| sessions dir: {session_dir}\n"
+            "+--------------------------------------------\n"
+        )
+
+    def _permission_status_text(self) -> str:
+        """生成 `/permissions` 的当前权限状态文本。"""
+
+        return (
+            "+-- permissions -----------------------------\n"
+            f"| current: {self._permission_mode}\n"
+            f"| modes: {', '.join(VALID_MODES)}\n"
+            "| shortcut: Shift+Tab cycles modes\n"
+            "+--------------------------------------------\n"
+        )
+
+    def _tools_status_text(self) -> str:
+        """生成 `/tools` 的当前工具状态文本。"""
+
+        names = self._registry.names()
+        tool_lines = "\n".join(f"| - {name}" for name in names) if names else "| (none)"
+        return (
+            "+-- tools -----------------------------------\n"
+            f"{tool_lines}\n"
+            "+--------------------------------------------\n"
+        )
 
     async def _approve_permission(
         self,
@@ -441,6 +544,60 @@ class TerminalApp:
         if value == "cancel":
             return None
         return _resolve_resume_selection(value, sessions, selection["index"])
+
+
+class _TerminalCommandContext:
+    """把 TerminalApp 的能力收窄成斜杠命令上下文。"""
+
+    def __init__(self, app: TerminalApp) -> None:
+        """保存当前终端应用实例。"""
+
+        self._app = app
+
+    def write(self, text: str, *, style: str | None = None) -> None:
+        """向终端输出本地命令结果。"""
+
+        self._app._write_command_output(text, style=style)
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        """切换当前权限模式。"""
+
+        self._app._set_permission_mode(mode)
+
+    async def run_turn(self, message: str) -> None:
+        """把消息提交给 Agent 执行。"""
+
+        await self._app._run_turn(message)
+
+    async def run_compact(self, custom_instructions: str | None = None) -> None:
+        """触发手动上下文压缩。"""
+
+        await self._app._run_compact(custom_instructions)
+
+    async def run_resume(self) -> None:
+        """触发会话恢复流程。"""
+
+        await self._app._run_resume()
+
+    def session_status(self) -> str:
+        """返回当前会话状态文本。"""
+
+        return self._app._session_status_text()
+
+    def memory_status(self) -> str:
+        """返回当前记忆状态文本。"""
+
+        return self._app._memory_status_text()
+
+    def permission_status(self) -> str:
+        """返回当前权限状态文本。"""
+
+        return self._app._permission_status_text()
+
+    def tools_status(self) -> str:
+        """返回当前工具状态文本。"""
+
+        return self._app._tools_status_text()
 
 
 def _permission_request_block(request: PermissionRequest) -> str:
@@ -638,6 +795,18 @@ def _filter_resume_sessions(
         or text in session.model.casefold()
         or text in session.first_user_message.casefold()
     ]
+
+
+def _current_prompt_text() -> str:
+    """读取当前 prompt_toolkit 输入内容；测试或非交互上下文返回空串。"""
+
+    app = get_app_or_none()
+    if app is None:
+        return ""
+    buffer = getattr(app, "current_buffer", None)
+    if buffer is None:
+        return ""
+    return str(getattr(buffer, "text", "") or "")
 
 
 class TerminalRenderer:
