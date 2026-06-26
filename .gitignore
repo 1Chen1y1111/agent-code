@@ -7,4 +7,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 pi
-docs
+docs/*
+!docs/images/
+!docs/images/**
